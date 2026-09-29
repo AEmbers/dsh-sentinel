@@ -58,6 +58,17 @@ import {
 import { probe, shouldFire } from './sensors.ts'
 import { SentinelStore, type FoldableRow } from './store.ts'
 
+// DSH 0.1.7 removed the shared catch-all `plugin` message-source kind: every
+// producer now declares its own `kind` by merging into `MessageSourceMap`.
+// Declaring ours here compiles against both the 0.1.5 and 0.1.7 type surfaces
+// (the interface exists in both), so the wakeup path needs no version split.
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    /** A sentinel watch fire delivered as a user-role wakeup. */
+    sentinel: { kind: 'sentinel' }
+  }
+}
+
 export const name = 'dsh-sentinel'
 // webServer is deliberately absent: headless profiles have no web server, and
 // the routes below mount through ctx.inject(['webServer']) instead.
@@ -941,7 +952,7 @@ class SentinelRuntime {
     try {
       agent.followup(createUserMessage({
         content: [{ type: 'text', text: batch.join('\n\n---\n\n') }],
-        source: { kind: 'plugin', plugin: PLUGIN_ID },
+        source: { kind: 'sentinel' },
       }))
     } catch (error: unknown) {
       this.warn(`wakeup delivery failed for session "${watch.sessionId}": ${describe(error)}`)
