@@ -12,7 +12,11 @@
  * fold over that log; the fold seeds probe baselines, so changes that happen
  * while a session sleeps (or the server is down) late-fire on the next probe.
  *
- * Registered tools: sentinel_watch / sentinel_list / sentinel_cancel.
+ * Registered tools: sentinel_watch / sentinel_list / sentinel_cancel /
+ * sentinel_restart. The restart tool hands the host off to a detached helper
+ * that kills and relaunches it, then wakes the calling session through the
+ * ordinary watch-fires path — see ./restart.ts for why the handoff is shaped
+ * that way.
  * Read-only routes: /plugins/dsh-sentinel/state (browser dock and sidebar
  * branch render it) and /plugins/dsh-sentinel/dashboard (server-global watch
  * table). Push route: POST /plugins/dsh-sentinel/hook?id=watch-N (webhooks).
@@ -28,7 +32,7 @@
  * notify webhook (at-most-once, never blocks wakeup delivery).
  */
 import { watch as fsWatch, type FSWatcher } from 'node:fs'
-import { mkdir, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, realpath, rename, stat, unlink, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import Schema from '@deepseek-ai/schemastery'
@@ -56,6 +60,17 @@ import {
   type Subscription,
 } from './domain.ts'
 import { probe, shouldFire } from './sensors.ts'
+import {
+  derivedRelaunch,
+  describeRelaunch,
+  goPath,
+  markerPath,
+  pruneRestartArtifacts,
+  requestPath,
+  restartDir,
+  spawnRestartHelper,
+  type RestartRequest,
+} from './restart.ts'
 import { SentinelStore, type FoldableRow } from './store.ts'
 
 // DSH 0.1.7 removed the shared catch-all `plugin` message-source kind: every
@@ -105,6 +120,27 @@ export interface Config {
    * events out of the harness.
    */
   notifyWebhookUrl?: string
+  /**
+   * Command line the detached restart helper runs to bring the host back.
+   * Empty (the default) rebuilds the current process's own command line from
+   * `process.execPath` + `process.execArgv` + `process.argv`. Set it when a
+   * supervisor owns the host (a service manager, a wrapper script) and should
+   * be the one to relaunch it.
+   */
+  restartCommand?: string
+  /**
+   * How long the restart helper waits for the calling agent to go idle before
+   * killing the host anyway (ms). The idle edge is what keeps a restart from
+   * truncating the very turn that requested it, so this is a safety valve for
+   * a session that never idles, not the normal path.
+   */
+  restartIdleTimeoutMs: number
+  /**
+   * After the kill, how long to wait for something else (the desktop app
+   * supervising its host child) to bring the host back before relaunching it
+   * ourselves (ms). Waiting avoids a doubled host and a port collision.
+   */
+  restartRespawnGraceMs: number
 }
 
 export const DEFAULT_CONFIG: Config = {
@@ -115,6 +151,8 @@ export const DEFAULT_CONFIG: Config = {
   defaultIntervalSeconds: DEFAULT_INTERVAL_SECONDS,
   defaultCooldownSeconds: DEFAULT_COOLDOWN_SECONDS,
   dutyLeaseTtlMs: 30_000,
+  restartIdleTimeoutMs: 120_000,
+  restartRespawnGraceMs: 8_000,
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -126,6 +164,9 @@ export const Config: Schema<Config> = Schema.object({
   defaultCooldownSeconds: Schema.number().default(DEFAULT_CONFIG.defaultCooldownSeconds).description('Cooldown used when a watch does not specify one (seconds).'),
   dutyLeaseTtlMs: Schema.number().default(DEFAULT_CONFIG.dutyLeaseTtlMs).description('Sentinel-duty lease TTL in ms: a second dsh process stays passive while a fresh lease exists; takeover happens this long after the owner dies.'),
   notifyWebhookUrl: Schema.string().description('Optional external notify webhook: every fire is POSTed there as JSON (at-most-once; failures never block wakeup delivery).'),
+  restartCommand: Schema.string().description('Command line the detached restart helper runs to relaunch the host; empty rebuilds the current process\'s own command line.'),
+  restartIdleTimeoutMs: Schema.number().default(DEFAULT_CONFIG.restartIdleTimeoutMs).description('How long the restart helper waits for the calling agent to go idle before killing the host anyway (ms).'),
+  restartRespawnGraceMs: Schema.number().default(DEFAULT_CONFIG.restartRespawnGraceMs).description('After the kill, how long to wait for a supervisor to bring the host back before relaunching it ourselves (ms).'),
 })
 
 const PLUGIN_ID = 'dsh-sentinel'
@@ -149,6 +190,56 @@ export function storePath(): string {
 export function leasePath(): string {
   const home = process.env['DSH_HOME'] ?? join(homedir(), '.dsh')
   return join(home, 'sentinel.lease')
+}
+
+/** An 8.3 short-name component still present in a Windows path (e.g. `ADMINI~1`). */
+const SHORT_NAME_COMPONENT = /(^|[\\/])[^\\/]*~\d/
+
+/**
+ * Canonicalize a path before handing it to `fs.watch`.
+ *
+ * On Windows libuv's fs-event backend does NOT throw when the watched
+ * DIRECTORY path still carries an 8.3 short component (e.g.
+ * `C:\Users\ADMINI~1\AppData\Local\Temp\...`): it aborts the entire process
+ * with `Assertion failed: !_wcsnicmp(filename, dir, dirlen), file
+ * src\win\fs-event.c, line 72` (exit 0xC0000409). That abort is not
+ * catchable, so the path has to be proven safe BEFORE the call. `realpath`
+ * resolves through the native implementation on Windows and expands short
+ * components; `undefined` means we could not prove it, and the caller must
+ * fall back to heartbeat polling rather than risk the process.
+ *
+ * Off Windows this returns the path unchanged, so POSIX arms behave exactly
+ * as before (an ENOENT still surfaces as a benign fsWatch throw).
+ */
+async function canonicalWatchPath(path: string): Promise<string | undefined> {
+  if (process.platform !== 'win32') return path
+  try {
+    return await realpath(path)
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Directory watches are the one libuv configuration that can abort the
+ * process, so on Windows a `parent` arm additionally refuses any path that
+ * still shows a short-name component after canonicalization. A false
+ * positive only costs that watch its push acceleration — the heartbeat poll
+ * still covers it — while the alternative is killing the whole harness.
+ */
+function watchPathIsSafe(path: string, mode: 'direct' | 'parent'): boolean {
+  if (process.platform !== 'win32' || mode !== 'parent') return true
+  return !SHORT_NAME_COMPONENT.test(path)
+}
+
+/** Existence probe that treats every failure as "not there". */
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await stat(path)
+    return true
+  } catch {
+    return false
+  }
 }
 
 /** Structural view of the host Agent surface this plugin touches. */
@@ -262,6 +353,18 @@ interface FireRecord {
   readonly after: string
 }
 
+/** An armed restart handoff: what the runtime needs to release and to describe it. */
+interface PendingRestart {
+  readonly id: string
+  readonly sessionId: string
+  readonly watchId: string
+  readonly goPath: string
+  readonly markerPath: string
+  readonly relaunch: string
+  /** Writes the go file that lets the helper proceed; idempotent. */
+  readonly release: () => void
+}
+
 /** All sentinel state for one session; lives as long as the server, not the agent. */
 class SessionWatch {
   folded: FoldedSentinel = { active: new Map(), lastOrdinal: 0, undeliveredFires: [] }
@@ -294,6 +397,12 @@ class SessionWatch {
 class SentinelRuntime {
   private readonly watches = new Map<string, SessionWatch>()
   private readonly resumes = new Map<string, Promise<AgentLike>>()
+  /**
+   * Handoffs armed by `sentinel_restart`, keyed by session. One per session:
+   * a second request while the first is still waiting for the idle edge would
+   * race two helpers over the same host.
+   */
+  private readonly pendingRestarts = new Map<string, PendingRestart>()
   private readonly handles: Array<{ dispose(): void | Promise<void> }> = []
   private timer: ReturnType<typeof setInterval> | undefined
   private disposed = false
@@ -304,7 +413,24 @@ class SentinelRuntime {
     private readonly ctx: ContextLike,
     private readonly store: SentinelStore,
     readonly config: Config,
-  ) {}
+  ) {
+    // "One duty owner per DSH_HOME" is only true while the lease outlives the
+    // renewal interval. The owner renews once per heartbeat, so the lease's age
+    // sawtooths up to one heartbeat plus scheduling jitter; if the TTL is not
+    // comfortably larger, every cycle contains a window where another instance
+    // sees the lease as stale AND the owner's pid as alive, claims duty itself,
+    // and probes and delivers alongside the owner. That is a duplicated wakeup
+    // with no corruption to recover from — the kind of failure that looks like
+    // a flake forever. Refuse the config instead, per the load-time-failure
+    // convention: two heartbeats of slack, minimum.
+    const minimumTtl = config.heartbeatMs * 2
+    if (!(config.dutyLeaseTtlMs >= minimumTtl)) {
+      throw new SentinelLogError(
+        `dutyLeaseTtlMs (${String(config.dutyLeaseTtlMs)}) must be at least twice heartbeatMs (${String(config.heartbeatMs)}); `
+        + `with a shorter lease the single-owner guarantee breaks and two processes wake the same session`,
+      )
+    }
+  }
 
   start(): void {
     this.timer = setInterval(() => { void this.drive() }, this.config.heartbeatMs)
@@ -396,6 +522,7 @@ class SentinelRuntime {
     if (this.duty) void unlink(leasePath()).catch(() => {})
     for (const watch of this.watches.values()) watch.closeSensors()
     this.watches.clear()
+    this.pendingRestarts.clear()
     for (const handle of this.handles.splice(0, this.handles.length)) {
       void Promise.resolve().then(() => handle.dispose()).catch(() => {})
     }
@@ -673,6 +800,138 @@ class SentinelRuntime {
     return { ...subscription, fireCount: 0 }
   }
 
+  /**
+   * Persist a probe baseline for one subscription before it is handed off.
+   *
+   * This single call is what makes the restart wakeup deterministic. The fold
+   * only records a baseline on a subscription's first observation, so without
+   * it a restart that lands before the first heartbeat would leave `lastKnown`
+   * empty — and the replacement host would absorb the marker as its own
+   * baseline instead of firing on it. Called by `sentinel_restart` while the
+   * old host is still alive and probing.
+   */
+  async primeBaseline(sessionId: string, id: string): Promise<void> {
+    const watch = this.watchOf(sessionId)
+    const sub = watch.folded.active.get(id)
+    if (sub === undefined) throw new SentinelLogError(`unknown watch "${id}"`)
+    const result = await probe(sub.spec)
+    await this.commit(watch, {
+      version: SENTINEL_CHANGE_VERSION,
+      change: 'baseline',
+      id,
+      at: new Date().toISOString(),
+      observed: { state: result.state, snapshot: result.snapshot },
+    })
+    // The refold above only seeds a probe slot it has never seen; this one
+    // already exists, so pin it explicitly to keep this host's own view honest.
+    watch.probes.set(id, {
+      nextDueAt: Date.now() + sub.spec.intervalSeconds * 1000,
+      probing: false,
+      lastSnapshot: result.snapshot,
+      lastState: result.state,
+    })
+  }
+
+  /** The handoff armed for this session, if any (surfaced by sentinel_list). */
+  pendingRestartOf(sessionId: string): PendingRestart | undefined {
+    return this.pendingRestarts.get(sessionId)
+  }
+
+  /**
+   * Arm a restart handoff: register the marker watch, persist its baseline,
+   * and start the detached helper. Everything destructive happens in the
+   * helper, after the calling agent goes idle — never in this turn.
+   */
+  async armRestart(
+    sessionId: string,
+    note: string,
+    command: string | undefined,
+    idleTimeoutMs: number,
+  ): Promise<PendingRestart> {
+    const existing = this.pendingRestarts.get(sessionId)
+    if (existing !== undefined) {
+      // The helper deletes its request file on every exit path, so a request
+      // that is gone means the previous handoff is over — succeeded (in which
+      // case this process is about to die anyway) or aborted, in which case a
+      // retry must not be blocked forever by a stale entry.
+      if (await pathExists(requestPath(existing.id))) {
+        throw new SentinelLogError('a restart handoff for this session is already armed; wait for it to fire or cancel its watch')
+      }
+      this.pendingRestarts.delete(sessionId)
+    }
+    const derived = derivedRelaunch()
+    if (command === undefined && derived === undefined) {
+      throw new SentinelLogError(
+        'cannot determine how to relaunch this process (no entry script in process.argv and no restartCommand configured); '
+        + 'refusing to restart, because nothing would bring the host back',
+      )
+    }
+    const cwd = derived?.cwd ?? process.cwd()
+    const relaunchText = command ?? describeRelaunch(derived?.argv ?? [])
+    await mkdir(restartDir(), { recursive: true })
+    await pruneRestartArtifacts()
+
+    const id = `${String(process.pid)}-${Date.now().toString(36)}`
+    const marker = markerPath(id)
+    const subscription = await this.create(
+      sessionId,
+      { kind: 'file', target: marker, intervalSeconds: MIN_INTERVAL_SECONDS },
+      note,
+      1,
+      this.config.defaultCooldownSeconds,
+    )
+
+    const request: RestartRequest = {
+      version: 1,
+      id,
+      hostPid: process.pid,
+      sessionId,
+      watchId: subscription.id,
+      goPath: goPath(id),
+      markerPath: marker,
+      logPath: join(restartDir(), `helper-${id}.log`),
+      ...(command !== undefined ? { command } : { argv: derived?.argv ?? [] }),
+      cwd,
+      ...(this.ctx.webServer?.port !== undefined ? { port: this.ctx.webServer.port } : {}),
+      idleTimeoutMs,
+      respawnGraceMs: this.config.restartRespawnGraceMs,
+    }
+    try {
+      await this.primeBaseline(sessionId, subscription.id)
+      await spawnRestartHelper(request)
+    } catch (error: unknown) {
+      // Never leave a watch behind whose marker nobody will ever write: it
+      // would probe a file that cannot appear, for as long as the host lives.
+      await this.cancel(sessionId, subscription.id, 'agent').catch(() => {})
+      throw error
+    }
+
+    let released = false
+    const pending: PendingRestart = {
+      id,
+      sessionId,
+      watchId: subscription.id,
+      goPath: request.goPath,
+      markerPath: marker,
+      relaunch: relaunchText,
+      release: () => {
+        if (released) return
+        released = true
+        void writeFile(request.goPath, new Date().toISOString(), 'utf8').catch(() => {})
+      },
+    }
+    this.pendingRestarts.set(sessionId, pending)
+    return pending
+  }
+
+  /**
+   * The agent reached an idle edge, so the turn that asked for the restart is
+   * over and its transcript is flushed: let the helper pull the plug.
+   */
+  releaseRestart(sessionId: string): void {
+    this.pendingRestarts.get(sessionId)?.release()
+  }
+
   /** Cancel durably — a sidecar write, no session involvement. */
   async cancel(sessionId: string, id: string, reason: 'agent' | 'user' | 'expired' | 'exhausted'): Promise<boolean> {
     const watch = this.watches.get(sessionId)
@@ -751,7 +1010,16 @@ class SentinelRuntime {
     if (watch.watchers.has(id) || this.disposed) return
     const failedAt = watch.watchFailures.get(id)
     if (failedAt !== undefined && Date.now() - failedAt < FILE_WATCH_RETRY_MS) return
-    const arm = (path: string, mode: 'direct' | 'parent'): void => {
+    /** Canonicalize and vet the path BEFORE libuv sees it (see canonicalWatchPath). */
+    const arm = async (rawPath: string, mode: 'direct' | 'parent'): Promise<void> => {
+      if (this.disposed || watch.watchers.has(id)) return
+      const path = await canonicalWatchPath(rawPath)
+      if (path === undefined || !watchPathIsSafe(path, mode)) {
+        // Cannot prove this path is safe to hand to libuv: skip the push arm
+        // and let the heartbeat poll carry the watch.
+        watch.watchFailures.set(id, Date.now())
+        return
+      }
       try {
         const watcher = fsWatch(path, { persistent: false }, (_event, fileName) => {
           if (mode === 'parent' && fileName !== null && fileName !== basename(target)) return
@@ -770,8 +1038,8 @@ class SentinelRuntime {
       }
     }
     void stat(target).then(
-      () => { arm(target, 'direct') },
-      () => { arm(dirname(target), 'parent') },
+      () => { void arm(target, 'direct') },
+      () => { void arm(dirname(target), 'parent') },
     )
   }
 
@@ -1032,6 +1300,18 @@ const CANCEL_OUTPUT_SCHEMA = {
   },
 } as const
 
+const RESTART_OUTPUT_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    requestId: { type: 'string', required: true },
+    watchId: { type: 'string', required: true },
+    relaunch: { type: 'string', required: true },
+    markerPath: { type: 'string', required: true },
+    idleTimeoutSeconds: { type: 'integer', required: true },
+  },
+} as const
+
 function textBlock(text: string): Array<{ type: 'text'; text: string }> {
   return [{ type: 'text', text }]
 }
@@ -1188,6 +1468,75 @@ function registerSentinelTools(runtime: SentinelRuntime, toolCtx: ContextLike, a
     },
     async execute(args: { id: string }) {
       return { cancelled: await runtime.cancel(agent.id, args.id, 'agent'), id: args.id }
+    },
+  })))
+
+  disposers.push(toolCtx.tools.register(defineTool({
+    name: 'sentinel_restart',
+    description: [
+      'Restart the dsh host process and be woken back into THIS session when it is up again, so you can',
+      ' continue debugging after a change that only takes effect on restart (a plugin install/update, host',
+      ' config, a native module). Frees you from asking the user to bounce the process by hand.',
+      ' How it works: a one-shot sentinel watch on a marker file is registered and its probe baseline is',
+      ' persisted FIRST; a detached helper then waits for this turn to go idle, kills the host tree, writes',
+      ' the marker while the host is down, and relaunches it (skipping the relaunch when a supervisor such as',
+      ' the desktop app already brought it back). The new host folds the watch, sees the marker as a real',
+      ' snapshot change, and wakes this session with your note.',
+      ' Call this LAST in a turn and then end the turn: the kill happens on the idle edge, so anything you do',
+      ' afterwards would be truncated. The whole dsh host goes down, including other sessions and any plugin',
+      ' holding the port — that is what "restart" means here.',
+      ' Refuses to act when it cannot determine a way to relaunch (no entry script and no restartCommand),',
+      ' because a host that does not come back is worse than no restart.',
+    ].join(''),
+    parameters: {
+      note: {
+        type: 'string',
+        required: true,
+        description: 'What your future self should do after the host comes back: where you left off, what to verify, which files you changed. Delivered verbatim as the wakeup message.',
+      },
+      confirm: {
+        type: 'boolean',
+        required: true,
+        description: 'Must be true. Explicit acknowledgement that this kills the entire dsh host process (all sessions), not just this one.',
+      },
+      command: {
+        type: 'string',
+        description: 'Optional shell command line used to relaunch the host. Omit to rebuild this process\'s own command line (process.execPath + execArgv + argv), which is the verified default.',
+      },
+      idle_timeout_seconds: {
+        type: 'number',
+        description: 'How long the helper waits for this turn to end before killing the host anyway (default 120).',
+      },
+    },
+    output: {
+      schema: RESTART_OUTPUT_SCHEMA,
+      render: (_args: unknown, value: { requestId: string; watchId: string; relaunch: string; markerPath: string; idleTimeoutSeconds: number }) =>
+        textBlock([
+          `重启交接已就绪: ${value.requestId}（哨兵订阅 ${value.watchId}）`,
+          `重启命令: ${value.relaunch}`,
+          `唤醒标记: ${value.markerPath}`,
+          `守卫进程会等本回合结束（最多 ${String(value.idleTimeoutSeconds)}s）后杀掉 dsh 宿主，重启完成后哨兵会把这个会话唤醒并交回你的便签。`,
+          '现在立刻结束本回合：回合结束后的任何操作都会被重启截断。',
+        ].join('\n')),
+    },
+    async execute(args: { note: string; confirm: boolean; command?: string; idle_timeout_seconds?: number }) {
+      const note = args.note.trim()
+      if (note === '') throw new SentinelLogError('note must not be empty — tell your future self what to do after the restart')
+      if (note.length > MAX_NOTE_LENGTH) throw new SentinelLogError(`note too long (${String(note.length)} > ${String(MAX_NOTE_LENGTH)})`)
+      if (args.confirm !== true) {
+        throw new SentinelLogError('confirm must be true: this restarts the whole dsh host process, ending every session it serves')
+      }
+      const idleTimeoutMs = args.idle_timeout_seconds !== undefined
+        ? Math.max(5_000, Math.round(args.idle_timeout_seconds * 1000))
+        : runtime.config.restartIdleTimeoutMs
+      const pending = await runtime.armRestart(agent.id, note, args.command, idleTimeoutMs)
+      return {
+        requestId: pending.id,
+        watchId: pending.watchId,
+        relaunch: pending.relaunch,
+        markerPath: pending.markerPath,
+        idleTimeoutSeconds: Math.round(idleTimeoutMs / 1000),
+      }
     },
   })))
 
@@ -1599,7 +1948,12 @@ export function apply(ctx: ContextLike, config: Config = DEFAULT_CONFIG): void {
         const disposers = registerSentinelTools(runtime, agent.ctx, agent)
         const stopStatus = agent.ctx.on('agent/status', (...statusArgs: never[]) => {
           const { status } = (statusArgs[0] as unknown as { status: string })
-          if (status === 'idle') runtime.flushWakeups(watch)
+          if (status !== 'idle') return
+          runtime.flushWakeups(watch)
+          // A restart handoff waits for exactly this edge: the turn that asked
+          // for it is over and its transcript is flushed, so the helper may
+          // now kill the host without truncating anything.
+          runtime.releaseRestart(agent.id)
         })
         return () => {
           stopStatus()

@@ -49,9 +49,12 @@ Node 侧持有一个与 server 同生命周期的运行时：把插件自己的 
     defaultCooldownSeconds: 60
     dutyLeaseTtlMs: 30000        # owner 死后被动实例的接管窗口
     notifyWebhookUrl: ''         # 可选：每次触发以 JSON POST 到这里
+    restartCommand: ''           # 重启守卫用什么命令拉起宿主（默认复用本进程自己的命令行）
+    restartIdleTimeoutMs: 120000 # 等当前回合结束再动手杀进程的最长时间
+    restartRespawnGraceMs: 8000  # 杀完之后等外部守护把宿主拉回来的宽限期
 ```
 
-非法值会让插件加载时以 schema 错误失败，而不是运行时乱来。
+非法值会让插件加载时以 schema 错误失败，而不是运行时乱来。`dutyLeaseTtlMs` 必须至少是 `heartbeatMs` 的两倍，否则运行时直接拒绝启动——owner 每个心跳续租一次，租约 TTL 短于心跳就意味每个周期里都有一段过期窗口，第二个实例会在窗口里抢到 duty、和 owner 一起投递同一次唤醒。
 
 `notifyWebhookUrl` 把每次触发以 JSON POST（`{plugin, event, sessionId, id, kind, target, note, fireNumber, maxFires, summary, after}`）送出 harness——指向飞书/企微/Slack 机器人或任意接收端都行。这条投递是 at-most-once：POST 失败只在日志里 warn，绝不阻塞 harness 内的唤醒。
 
@@ -60,6 +63,30 @@ Node 侧持有一个与 server 同生命周期的运行时：把插件自己的 
 - `sentinel_watch` — 注册 watch：`kind`、`target`、可选 `pattern`、`interval`（1–3600 秒，默认 30）、`note`（随每次唤醒原样送达）、`maxFires`（默认 1：一次性）、`cooldown`（默认 60 秒）、可选 `ttl`。
 - `sentinel_list` — 列出活跃 watch 及其实时探测状态。
 - `sentinel_cancel` — 按 id 取消一条 watch。
+- `sentinel_restart` — 重启 dsh 宿主，并在它回来后把这个会话唤醒（见下）。
+
+### 重启宿主并自己回来
+
+`sentinel_restart({ note, confirm: true })` 专门解决插件平时做不到的那件事：插件就住在它要重启的那个进程里。
+装插件、改宿主配置、重编原生模块——这些都要重启才生效，而重启通常意味着只能请人去点一下。
+
+交接过程刻意让「动手杀进程」那一半留在宿主外面，而「活下来的那一半」不需要任何进程在跑：
+
+1. 工具先注册一条盯着 `$DSH_HOME/sentinel-restart/ready-<id>.flag` 的一次性 `file` watch，**并且在动手之前先探测一次、
+   把这个 watch 的基线落盘**。fold 只在订阅的第一次观测时记录基线，少了这一步，重启如果早于第一个心跳发生，
+   替代宿主就没有可比对的基线——它会把标记文件吸收成自己的基线而不是触发它。
+2. 一个 detached 的守卫进程（分两次 spawn，脱离了宿主的父 PID 链，否则会被自己发起的杀进程带走）先等调用它的
+   agent 走到 **idle 边沿**。这一步才是重启不会截断「发起重启的那个回合」的原因。
+3. 守卫杀掉宿主进程树，在宿主停机期间写下标记文件，然后先等 `restartRespawnGraceMs`——桌面端这类守护进程
+   可能会自己把宿主子进程拉回来，再拉一份就会撞端口。
+4. 替代宿主折叠 sidecar、重新播种探测基线，看到标记文件相对 `<absent>` 是一次真实的快照变化，于是带着你的便签
+   唤醒那个休眠会话。
+
+标记文件是两个进程之间**全部**的接口：没有端口、没有 URL、没有需要对齐的就绪握手。当工具无法确定重启命令
+（`process.argv` 里没有入口脚本、也没配 `restartCommand`）时它会**拒绝执行**，而不是杀掉一个没人拉得起来的宿主。
+
+因为杀进程发生在 idle 边沿，请把 `sentinel_restart` 放在回合最后调用，然后**立刻结束回合**——之后的任何操作都会被截断。
+它会带走整个 dsh 宿主：它服务的每个会话，以及任何占着端口的插件。这里的「重启」就是这个意思。
 
 ## 路由
 
@@ -75,6 +102,20 @@ Node 侧持有一个与 server 同生命周期的运行时：把插件自己的 
 
 在以下宿主版本上实测通过（插件加载、duty 租约持有、web 路由应答均正常）：
 
+- `0.2.0-rc.2` —— 2026-10-01，Windows 桌面端实测：harness 依赖范围重新钉到 0.2.0 线，`@deepseek-ai/schemastery`
+  对齐到宿主的 `^3.18.4`——0.2.0 的 schema 类型面更严，`Schema<Config>` 不再接受 `meta.default` 带 schemastery
+  新版 `Volatile` 标记的 schema。顺带查出并修掉两个 Windows 缺陷：对「路径里还留着 8.3 短名成分」（如
+  `C:\Users\ADMINI~1\...`）的**目录**做 `fs.watch` 会让 libuv 直接 abort 整个进程——
+  `Assertion failed: !_wcsnicmp(filename, dir, dlen), file src\win\fs-event.c, line 72`，退出码 0xC0000409，
+  且 try/catch 拦不住——所以 file watch 的挂载现在先用 `realpath`（Windows 上走原生实现，会展开短名）
+  规范化，并对无法证明安全的目录挂载直接放弃、退回心跳轮询；另一处是 command 探测的测试夹具用了
+  POSIX 专有的 `printf`/`exit`。实测：`pnpm typecheck` 干净，Windows 上全部 70 个测试通过，
+  其中包括此前会把测试进程直接 abort 掉的 e2e 文件推送测试。顺带把套件里两个潜在 flake 也一并关掉了，
+  而不是绕过去：duty-owner 测试原本用 `heartbeatMs: 500` 配 `dutyLeaseTtlMs: 400`，这个组合下
+  「单一 owner」的保证在每个周期里有约 20% 时间**按构造就不成立**（运行时现在会直接拒绝这种配置）；
+  另有几处测试用固定 sleep 等「file watch 的第一次探测必须在被监视文件出现之前落地」，
+  断言的其实是「调度器赏脸」——现在改为轮询 sidecar 里那条持久化基线行。改动后连续 29 轮全量跑里只有 1 轮失败、
+  且之后 20 轮再没复现（那一轮与一次并发构建重叠），改动前大约 3 轮里就有 1 轮失败
 - `0.1.7-rc.2` —— 2026-09-29，对线上 profile 的副本做整轮净装升级彩排：0.1.7 删除了共享的兜底 `plugin` 消息来源 kind（改为每个生产者声明自己的），因此唤醒携带 `{ kind: 'sentinel' }`——在会话流里落位同为 `context`，两条版本线上都渲染为 "Sentinel"。harness 依赖范围也重新钉到 0.1.7 线：严格 semver 下 `>=0.1.5-rc.2 <0.2.0` **不包含** `0.1.7-rc.2`（预发布规则），若不改，0.1.7 宿主会把本插件的 harness import 解析到 0.1.5 的副本——正是 0.1.5 对齐时消除掉的那类漂移。实测：`pnpm typecheck` 与全部 63 个测试通过，插件激活并持有 duty 租约，web 路由应答正常，下发的客户端 bundle 含 `sidebar.panellist`（boot 图 65 条）
 - `0.1.5-rc.2` —— 2026-09-15，对齐 0.1.5 后的正式 web 部署实测：插件整条运行时 import 闭包都解析到部署线（harness 依赖改为显式 dependencies，profile 里更旧的 hoisted 副本再也遮不住它们），客户端半侧去掉 shim 后按真实 0.1.5 类型构建，`pnpm typecheck` 与全部 63 个测试通过，线上文件 watch 在改动后 1s 内经 inotify 触发，唤醒作为 plugin 来源的会话消息投递进会话；重启后部署下发的是新的客户端半侧（bundle rev 变更、含 `sidebar.panellist`、boot 图 54 条）
 - `0.1.5-alpha.2` —— 2026-09-09，临时 web profile 实测：Node 插件加载、duty 租约、state/dashboard 路由和浏览器插件 bundle 均正常，浏览器控制台无报错；`conversation.input.dock` 仍是有效的会话级 list slot，插件 sidecar 不受 Session V3 迁移影响

@@ -49,9 +49,12 @@ All deployment-tunable knobs live in the plugin's config schema (defaults in par
     defaultCooldownSeconds: 60
     dutyLeaseTtlMs: 30000        # passive-instance takeover window after the owner dies
     notifyWebhookUrl: ''         # optional: POST every fire here as JSON
+    restartCommand: ''           # how the restart helper relaunches the host (default: this process's own command line)
+    restartIdleTimeoutMs: 120000 # how long it waits for the calling turn to end before killing the host anyway
+    restartRespawnGraceMs: 8000  # after the kill, how long to wait for a supervisor to bring the host back
 ```
 
-Invalid values fail plugin load with a schema error rather than misbehaving at runtime.
+Invalid values fail plugin load with a schema error rather than misbehaving at runtime. `dutyLeaseTtlMs` must be at least twice `heartbeatMs` and the runtime refuses to start otherwise — the owner renews once per heartbeat, so a shorter lease is stale for part of every cycle and a second instance can claim duty beside it and deliver the same wakeup twice.
 
 `notifyWebhookUrl` fans every fire out of the harness as a JSON POST (`{plugin, event, sessionId, id, kind, target, note, fireNumber, maxFires, summary, after}`) — point it at a Lark/WeCom/Slack bot or any receiver. Delivery is at-most-once: a failed POST warns in the log and never blocks the in-harness wakeup.
 
@@ -60,6 +63,37 @@ Invalid values fail plugin load with a schema error rather than misbehaving at r
 - `sentinel_watch` — register a watch: `kind`, `target`, optional `pattern`, `interval` (1–3600s, default 30), `note` (delivered verbatim with every wakeup), `maxFires` (default 1: one-shot), `cooldown` (default 60s), optional `ttl`.
 - `sentinel_list` — active watches with live probe state.
 - `sentinel_cancel` — cancel one watch by id.
+- `sentinel_restart` — restart the dsh host and be woken back into the same session (see below).
+
+### Restarting the host and coming back
+
+`sentinel_restart({ note, confirm: true })` exists for the one thing a plugin normally cannot do: a plugin
+lives *inside* the process it would have to restart. Install a plugin, change host config, rebuild a native
+module — the change only lands after a bounce, and a bounce normally means asking the human to do it by hand.
+
+The handoff is built so that the destructive half happens outside the host, and the surviving half needs no
+running process at all:
+
+1. The tool registers a one-shot `file` watch on `$DSH_HOME/sentinel-restart/ready-<id>.flag` and — crucially —
+   **probes and persists that watch's baseline before anything is killed**. The fold only records a baseline on
+   a subscription's first observation, so without this step a restart landing before the first heartbeat would
+   leave the replacement host nothing to compare against, and it would silently absorb the marker as its own
+   baseline instead of firing on it.
+2. A detached helper (staged twice, so it no longer hangs off the host's parent-PID chain) waits for the calling
+   agent to reach an **idle edge**. That is what stops a restart from truncating the very turn that asked for it.
+3. The helper kills the host tree, writes the marker while the host is down, then waits
+   `restartRespawnGraceMs` before relaunching — a supervisor (the desktop app watching its host child) may
+   bring the host back on its own, and doubling it would collide on the port.
+4. The replacement host folds the sidecar, re-seeds the probe baseline, sees the marker as a real snapshot
+   change against `<absent>`, and wakes the dormant session with your note.
+
+The marker file is the *entire* interface between the two processes: no port, no URL, no readiness handshake
+to get wrong. When the tool cannot determine a relaunch command (no entry script in `process.argv` and no
+`restartCommand` configured) it refuses instead of killing a host nothing would bring back.
+
+Because the kill happens on the idle edge, call `sentinel_restart` last in a turn and then **end the turn**;
+anything after it would be cut off. It takes down the whole dsh host — every session it serves, and any plugin
+holding the port. That is what "restart" means here.
 
 ## Routes
 
@@ -75,6 +109,23 @@ First-probe semantics: a pattern-less watch absorbs its first observation as the
 
 Verified against these harness versions (plugin loads, duty lease is held, web routes answer):
 
+- `0.2.0-rc.2` — 2026-10-01, Windows desktop deployment: harness ranges re-pinned to the 0.2.0 line and
+  `@deepseek-ai/schemastery` aligned to the host's `^3.18.4`, which is what the stricter 0.2.0 schema typing
+  needs (`Schema<Config>` no longer accepted a schema whose `meta.default` carries schemastery's newer
+  `Volatile` markers). Two Windows defects were found and fixed on the way: `fs.watch` on a **directory**
+  whose path still holds an 8.3 short component (e.g. `C:\Users\ADMINI~1\...`) makes libuv abort the whole
+  process — `Assertion failed: !_wcsnicmp(filename, dir, dirlen), file src\win\fs-event.c, line 72`, exit
+  0xC0000409, uncatchable — so the file-watch arm now canonicalizes with `realpath` (which expands short
+  names on Windows) and refuses a directory arm whose path it cannot prove safe, falling back to heartbeat
+  polling; and the command-probe fixture used POSIX-only `printf`/`exit`. Verified: `pnpm typecheck` clean and
+  all 70 tests pass on Windows, including the e2e file-watch push test that previously aborted the runner.
+  Two latent flakes in that suite were also found and closed rather than papered over: the duty-owner test ran
+  `dutyLeaseTtlMs: 400` under `heartbeatMs: 500`, a configuration in which the single-owner guarantee is false
+  by construction for ~20% of every cycle (the runtime now refuses it), and several tests slept fixed durations
+  where a file watch's first probe had to land before the watched file appeared — the assertion was really
+  "the scheduler was kind", so they now poll the durable sidecar row instead. Measured across 29 consecutive
+  full-suite runs after the change: one failure that never reproduced (in a run overlapping a concurrent
+  build), against roughly one failing run in three before
 - `0.1.7-rc.2` — 2026-09-29, clean-profile upgrade rehearsal against a copy of the live profile: 0.1.7 removed the shared catch-all `plugin` message-source kind (every producer now declares its own), so a wakeup carries `{ kind: 'sentinel' }` — same `context` placement in the transcript, and it renders as "Sentinel" on both lines. The harness dependency range was also re-pinned to the 0.1.7 line, because under strict semver `>=0.1.5-rc.2 <0.2.0` does **not** admit `0.1.7-rc.2` (the prerelease rule); left alone, a 0.1.7 host would have resolved this plugin's harness imports to 0.1.5 copies — the exact drift the 0.1.5 alignment removed. Verified: `pnpm typecheck` and all 63 tests pass, the plugin activates and holds the duty lease, the web routes answer, and the served client bundle carries `sidebar.panellist` (65 boot rows)
 - `0.1.5-rc.2` — 2026-09-15, live web deployment after the 0.1.5 alignment: the plugin's whole runtime import closure resolves to the deployed line (its harness imports are declared dependencies, so a profile's older hoisted copies can no longer shadow them), the client half builds against the real 0.1.5 types with no shims, `pnpm typecheck` and all 63 tests pass, and a live file watch fired through inotify 1s after the change and the wakeup was delivered into the session as a plugin-sourced message; after the restart the deployment serves the new client half (bundle rev changed, `sidebar.panellist` present, 54 boot rows)
 - `0.1.5-alpha.2` — 2026-09-09, temporary web-profile smoke: Node plugin load, duty lease, state/dashboard routes, and the browser plugin bundle all worked with no browser-console errors; `conversation.input.dock` remains a supported session-scoped list slot, and the plugin sidecar is unaffected by the Session V3 migration
@@ -86,17 +137,19 @@ Compatibility means the cordis loader entries, the `ctx.agents` followup channel
 
 ## Install
 
+This is the fork [`AEmbers/dsh-sentinel`](https://github.com/AEmbers/dsh-sentinel), tracking upstream
+[`fuhefei/dsh-sentinel`](https://github.com/fuhefei/dsh-sentinel) with the 0.2.0-line compatibility work and the
+`sentinel_restart` tool. Build artifacts are committed, so a git-source install runs no build:
 
-One line through the official bundle channel:
+```sh
+dsh plugin --profile <profile> add "github:AEmbers/dsh-sentinel#v0.13.0"
+```
+
+Upstream, through the official bundle channel or from git:
 
 ```sh
 dsh plugin --profile web add dsh-sentinel
-```
-
-Or straight from git (build artifacts are committed, so the git-source install runs no build):
-
-```sh
-dsh plugin --profile web add "github:fuhefei/dsh-sentinel#v0.11.0"
+dsh plugin --profile web add "github:fuhefei/dsh-sentinel#v0.12.1"
 ```
 
 Alternatively, add the node half manually through a patch-list configuration over the shipped base:

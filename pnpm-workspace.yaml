@@ -1,0 +1,6 @@
+# pnpm 11 moved build-script approval out of package.json into this file.
+# esbuild's postinstall only links its platform binary, but without the approval
+# pnpm makes EVERY install exit non-zero (ERR_PNPM_IGNORED_BUILDS), which turns
+# `pnpm test` / `pnpm typecheck` into failures before a single test runs.
+allowBuilds:
+  esbuild: true

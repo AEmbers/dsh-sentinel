@@ -101,9 +101,48 @@ function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
 
-async function storeLines(): Promise<Array<{ sessionId: string; change: { change: string } }>> {
+async function storeLines(): Promise<Array<{ sessionId: string; change: { change: string; id?: string } }>> {
   const text = await readFile(storePath(), 'utf8')
-  return text.split('\n').filter(line => line.trim() !== '').map(line => JSON.parse(line) as { sessionId: string; change: { change: string } })
+  return text.split('\n').filter(line => line.trim() !== '').map(line => JSON.parse(line) as { sessionId: string; change: { change: string; id?: string } })
+}
+
+/**
+ * Poll a synchronous condition instead of sleeping a guessed duration.
+ *
+ * Every one of these tests used to encode "this probably finished in N ms",
+ * which is exactly what turns a green suite into a coin flip once the five spec
+ * files run in parallel and the machine is loaded. Waiting on the condition
+ * itself is both faster and deterministic.
+ */
+async function waitUntil(check: () => boolean, timeoutMs: number, label: string): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (check()) return
+    await sleep(50)
+  }
+  throw new Error(`timed out after ${String(timeoutMs)}ms waiting for ${label}`)
+}
+
+/**
+ * Wait until a subscription's first observation is durable.
+ *
+ * A pattern-less watch absorbs its first probe as the baseline, so writing the
+ * watched file before that probe lands makes the change BE the baseline and
+ * nothing ever fires — a silent zero, not an error. Polling the sidecar row is
+ * the only way to know the race is over rather than hope so.
+ */
+async function waitForBaseline(id: string, timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    try {
+      const rows = await storeLines()
+      if (rows.some(row => row.change.change === 'baseline' && row.change.id === id)) return
+    } catch {
+      // A concurrent append can be caught mid-line; that is not a failure.
+    }
+    await sleep(50)
+  }
+  throw new Error(`timed out after ${String(timeoutMs)}ms waiting for the baseline of ${id}`)
 }
 
 describe('sentinel end-to-end (in-process)', () => {
@@ -136,6 +175,7 @@ describe('sentinel end-to-end (in-process)', () => {
     expect(names).toContain('sentinel_watch')
     expect(names).toContain('sentinel_list')
     expect(names).toContain('sentinel_cancel')
+    expect(names).toContain('sentinel_restart')
 
     const dir = await mkdtemp(join(tmpdir(), 'sentinel-e2e-'))
     dirs.push(dir)
@@ -726,7 +766,12 @@ describe('sentinel end-to-end (in-process)', () => {
 
   it('runs one duty owner per DSH_HOME: passive instance defers, then takes over', async () => {
     await freshHome()
-    const cfg = { ...DEFAULT_CONFIG, heartbeatMs: 500, dutyLeaseTtlMs: 400 }
+    // The lease must outlive the renewal interval or the single-owner guarantee
+    // is false by construction: with a TTL below the heartbeat there is a stale
+    // window every cycle, and a second instance booting inside it claims duty
+    // and delivers alongside the owner. This config keeps ~4.5x slack, so the
+    // assertions below test takeover, not scheduling luck.
+    const cfg = { ...DEFAULT_CONFIG, heartbeatMs: 200, dutyLeaseTtlMs: 900 }
 
     // Owner claims the duty lease first.
     const owner = makeHarness()
@@ -748,24 +793,28 @@ describe('sentinel end-to-end (in-process)', () => {
     dirs.push(leaseDir)
     const leaseFlag = join(leaseDir, 'flag.txt')
     await watchTool.execute({ kind: 'file', target: leaseFlag, interval_seconds: 5, note: 'passive defers', max_fires: 1 }, {})
-    await sleep(1500)
+    // The owner probes it (the passive instance defers), so waiting on the
+    // durable baseline row is also waiting for the owner to have adopted the
+    // watch — which is the thing the old fixed sleep was guessing at.
+    await waitForBaseline('watch-1')
     await writeFile(leaseFlag, 'owner should deliver this')
-    await sleep(2500)
+    await waitUntil(() => owner.followups.length === 1, 10_000, 'the owner to deliver the passive-created watch')
     expect(passive.followups.length).toBe(0)
-    expect(owner.followups.length).toBe(1)
 
     // Owner exits (lease released): the passive instance takes over within a
     // heartbeat and now probes and delivers itself.
     for (const cleanup of owner.cleanups.splice(0, owner.cleanups.length)) cleanup()
-    await sleep(1000)
+    // Takeover waits out the 900ms TTL plus a 200ms heartbeat, so give it room.
+    await sleep(1600)
     const dir = await mkdtemp(join(tmpdir(), 'sentinel-lease-'))
     dirs.push(dir)
     const flag = join(dir, 'flag.txt')
     await watchTool.execute({ kind: 'file', target: flag, interval_seconds: 5, note: 'takeover', max_fires: 1 }, {})
-    await sleep(1200)
+    // Nothing probes watch-2 until the passive instance owns duty, so this row
+    // appearing proves the takeover happened AND the baseline is in place.
+    await waitForBaseline('watch-2')
     await writeFile(flag, 'took over')
-    await sleep(1500)
-    expect(passive.followups.length).toBe(1)
+    await waitUntil(() => passive.followups.length === 1, 10_000, 'the new owner to deliver')
     expect(passive.followups[0]).toContain('订阅 watch-2 触发')
   }, 25_000)
 
@@ -796,11 +845,12 @@ describe('sentinel end-to-end (in-process)', () => {
     const watchTool = harness.tools.find(tool => tool.name === 'sentinel_watch')
     if (watchTool === undefined) throw new Error('watch tool missing')
     await watchTool.execute({ kind: 'file', target: flag, interval_seconds: 5, note: 'notify fanout', max_fires: 1 }, {})
-    await sleep(1200)
+    // Writing the flag before the baseline lands would make the change the
+    // baseline instead of a transition, and the test would see a silent zero.
+    await waitForBaseline('watch-1')
     await writeFile(flag, 'go')
-    await sleep(2500)
+    await waitUntil(() => received.length === 1, 10_000, 'the notify webhook POST')
 
-    expect(received.length).toBe(1)
     expect(received[0]?.['event']).toBe('fired')
     expect(received[0]?.['id']).toBe('watch-1')
     expect(received[0]?.['summary']).toContain('快照')

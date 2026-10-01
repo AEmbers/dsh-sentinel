@@ -121,10 +121,16 @@ describe('probe', () => {
   })
 
   it('captures command exit and output', async () => {
-    const ok = await probe({ kind: 'command', target: 'printf sentinel-ok', intervalSeconds: 5 })
+    // The command probe runs through the platform's shell (`cmd.exe` on
+    // Windows, `/bin/sh` elsewhere), so the fixtures have to be shell-builtins
+    // that exist on both rather than POSIX-only `printf` / `exit`.
+    const windows = process.platform === 'win32'
+    const print = windows ? 'echo sentinel-ok' : 'printf sentinel-ok'
+    const fail = windows ? 'exit /b 3' : 'exit 3'
+    const ok = await probe({ kind: 'command', target: print, intervalSeconds: 5 })
     expect(ok.state).toBe('exit 0')
     expect(ok.snapshot).toContain('sentinel-ok')
-    const bad = await probe({ kind: 'command', target: 'exit 3', intervalSeconds: 5 })
+    const bad = await probe({ kind: 'command', target: fail, intervalSeconds: 5 })
     expect(bad.state).toBe('exit 3')
   })
 
