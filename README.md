@@ -140,10 +140,9 @@ Under a supervisor the correct move is to write the marker and stop: the supervi
 and the marker plus the durable watch mean the wakeup fires whenever it brings the host back, however long
 the operator takes.
 
-The desktop app window is still the casualty of the kill itself — it is the host's parent, so it survives and
-lands on that dialog. In supervised mode that dialog is now the *intended* recovery path: click 重启应用 (or
-close and reopen the app), the app starts a fresh host, that host binds the port normally, finds the marker,
-and wakes your session.
+The desktop app window is the casualty of the kill itself — it is the host's parent. Under v0.13.4 that
+dialog was the intended recovery path (click 重启应用 and the app starts a fresh host, which binds the port,
+finds the marker, and wakes your session). Under v0.13.5 there is no dialog and nothing to click; see below.
 
 ### …and the fix, verified on the same host
 
@@ -167,6 +166,39 @@ The two runs are separated cleanly by their crash reports: the broken one left *
 `listen EADDRINUSE` reports at `phase: startup`, and the fixed one leaves **one** report at `phase: running`
 — the app noticing that its host was killed, which is exactly the dialog the operator is meant to answer.
 Nothing at all about the port.
+
+### …but a click is not an automatic restart (v0.13.5)
+
+Keeping the port free made the feature useless on Desktop: the operator still had to answer the dialog by
+hand, which is the one thing `sentinel_restart` exists to avoid.
+
+That dialog cannot be dodged by exiting differently. The app's host supervisor is
+
+```js
+child.once("close", (code) => {
+  const suffix = this.stderr.trim() === "" ? "" : `: ${this.stderr.trim()}`;
+  if (code !== 0 && code !== null) this.fail(new Error(`dsh desktop host exited with ${code}${suffix}`));
+  else this.fail(new Error(`dsh desktop host stopped${suffix}`));
+  resolve();
+});
+```
+
+— **both** branches call `this.fail()`, so no exit code ends quietly. The app's own restart is `app.relaunch()`
+inside a button handler, which nothing outside the app can invoke, and launching the binary a second time is
+routed to `second-instance`, whose handler only focuses the running window.
+
+So the helper now takes the supervisor down **first**, then its host, and relaunches the app itself:
+
+- Killing the app *before* its host is the whole trick: the app is gone before its `close` handler can run, so
+  the modal dialog never appears at all.
+- The relaunch strips `ELECTRON_RUN_AS_NODE` — the host is Electron running as Node and the helper inherits
+  that variable — so what starts is the normal GUI app. It spawns a host of its own, which binds the port,
+  folds the sidecar, sees the marker, and wakes the session. Nothing to click.
+- The window closes and comes back on its own. That flash is the visible cost of an unattended restart, and it
+  is the only one.
+
+A supervisor that cannot be relaunched this way (plain Node under an IPC-speaking parent) still gets the
+v0.13.4 treatment: marker written, port left alone, operator told to restart it.
 
 ## Routes
 

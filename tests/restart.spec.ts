@@ -33,6 +33,41 @@ async function freshHome(): Promise<string> {
   return dir
 }
 
+/**
+ * Stage 1 re-spawns itself detached and exits immediately (the host tree is
+ * killed through the parent-PID chain, so a helper still hanging off the host
+ * would be killed by its own hand). `execFileSync` therefore returns long
+ * before the kill; wait for stage 2 to write its final line instead.
+ */
+async function waitForLog(path: string, needle: string, timeoutMs = 25_000): Promise<string> {
+  const deadline = Date.now() + timeoutMs
+  let log = ''
+  while (Date.now() < deadline) {
+    log = await readFile(path, 'utf8').catch(() => '')
+    if (log.includes(needle)) return log
+    await new Promise(resolve => setTimeout(resolve, 100))
+  }
+  return log
+}
+
+/** Poll until `path` exists: a stand-in process writes it asynchronously. */
+async function waitForPath(path: string, timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline && !existsSync(path)) {
+    await new Promise(resolve => setTimeout(resolve, 50))
+  }
+}
+
+/** Signal 0 probes liveness without disturbing the target. */
+function isAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
 describe('derivedRelaunch', () => {
   it('rebuilds the exact command line that started this process', () => {
     const plan = derivedRelaunch(
@@ -112,14 +147,22 @@ describe('the embedded helper script', () => {
     for (const field of [
       'hostPid', 'goPath', 'markerPath', 'logPath', 'idleTimeoutMs',
       'respawnGraceMs', 'cwd', 'argv', 'command', 'supervised',
+      'supervisorPid', 'supervisorRelaunch',
     ]) {
       expect(source).toContain(`request.${field}`)
     }
-    // Ordering is load-bearing, not cosmetic: the supervised guard has to be
-    // tested BEFORE either relaunch branch, or a supervised host with a
-    // `command` set would still relaunch and steal the supervisor's port.
-    expect(source.indexOf('request.supervised === true'))
-      .toBeLessThan(source.indexOf('request.command !== undefined'))
+    // Ordering is load-bearing, not cosmetic. Relaunching the supervisor is the
+    // only correct answer once the supervisor went down with the host, so it has
+    // to be tested before the guarded refusal; and the refusal has to come
+    // before either host relaunch, or a supervised host with a `command` set
+    // would still relaunch and steal the supervisor's port.
+    const order = [
+      'request.supervisorRelaunch !== undefined',
+      'request.supervised === true',
+      'request.command !== undefined',
+    ].map(needle => source.indexOf(needle))
+    expect(order.every(index => index >= 0)).toBe(true)
+    expect(order).toStrictEqual([...order].sort((a, b) => a - b))
   })
 
   // Windows only because the host tree is torn down through the parent-PID
@@ -160,17 +203,7 @@ describe('the embedded helper script', () => {
     await writeFile(request.goPath, new Date().toISOString(), 'utf8')
 
     execFileSync(process.execPath, [helperPath(), requestPath(id)], { stdio: 'pipe' })
-    // Stage 1 re-spawns itself detached and exits immediately (on Windows the
-    // host tree is killed through the parent-PID chain, so a helper still
-    // hanging off the host would be killed by its own hand). execFileSync
-    // therefore returns long before the kill; wait for stage 2 to finish.
-    const settled = Date.now() + 20_000
-    let log = ''
-    while (Date.now() < settled) {
-      log = await readFile(request.logPath, 'utf8').catch(() => '')
-      if (log.includes('helper done')) break
-      await new Promise(resolve => setTimeout(resolve, 100))
-    }
+    const log = await waitForLog(request.logPath, 'helper done')
     expect(log).toContain('helper done')
 
     // The wakeup still happened — the marker is the whole point of the trip.
@@ -181,5 +214,77 @@ describe('the embedded helper script', () => {
     // The guard cleaned up after itself either way.
     expect(existsSync(requestPath(id))).toBe(false)
     host.kill()
+  })
+
+  // The automatic path for the Desktop app: its close handler calls this.fail()
+  // for EVERY exit code, so a graceful host exit still parks a modal dialog on
+  // screen. Taking the app down first — and only then its host — is the one
+  // sequence that keeps the dialog from ever appearing, and relaunching the app
+  // is what brings a host (and the wakeup) back with no operator action.
+  it.runIf(process.platform === 'win32')('takes the supervisor down first and relaunches it', async () => {
+    const home = await freshHome()
+    await writeRestartHelper()
+
+    // A sacrificial "app" that parents a sacrificial "host": the tree walk is
+    // by parent PID, so an unrelated supervisor would not take the host with it.
+    const hostPidFile = join(home, 'host.pid')
+    const appScript = [
+      'const { spawn } = require("node:child_process")',
+      'const fs = require("node:fs")',
+      'const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" })',
+      `fs.writeFileSync(${JSON.stringify(hostPidFile)}, String(child.pid))`,
+      'setInterval(() => {}, 1000)',
+    ].join(';')
+    const app = spawn(process.execPath, ['-e', appScript], { stdio: 'ignore' })
+    await waitForPath(hostPidFile)
+    const hostPid = Number(await readFile(hostPidFile, 'utf8'))
+    expect(hostPid).toBeGreaterThan(0)
+
+    const relaunchFlag = join(home, 'app-relaunched.flag')
+    const id = 'spec-supervisor'
+    const request: RestartRequest = {
+      version: 1,
+      id,
+      hostPid,
+      sessionId: 'session-spec',
+      watchId: 'watch-1',
+      goPath: goPath(id),
+      markerPath: markerPath(id),
+      logPath: join(restartDir(), `helper-${id}.log`),
+      // Would run only if the helper ignored the supervisor entirely.
+      argv: [process.execPath, '-e', 'void 0'],
+      cwd: home,
+      supervised: true,
+      supervisorPid: app.pid,
+      // Stands in for the desktop app: runs, drops a file, exits.
+      supervisorRelaunch: [
+        process.execPath,
+        '-e',
+        `require("node:fs").writeFileSync(${JSON.stringify(relaunchFlag)}, "up")`,
+      ],
+      idleTimeoutMs: 5000,
+      respawnGraceMs: 200,
+    }
+    await writeFile(requestPath(id), `${JSON.stringify(request)}\n`, 'utf8')
+    await writeFile(request.goPath, new Date().toISOString(), 'utf8')
+
+    execFileSync(process.execPath, [helperPath(), requestPath(id)], { stdio: 'pipe' })
+    const log = await waitForLog(request.logPath, 'helper done')
+    expect(log).toContain('helper done')
+
+    expect(log).toContain('killing supervisor tree')
+    expect(log).toContain('relaunching the supervising app')
+    expect(log).not.toContain('not relaunching')
+    // The supervisor really was relaunched. The relaunch is detached and the
+    // helper does not wait on it (there is no port in this request to probe),
+    // so the flag may land after 'helper done' — poll rather than race it.
+    await waitForPath(relaunchFlag)
+    expect(existsSync(relaunchFlag)).toBe(true)
+    // …and the wakeup was still armed while everything was down.
+    expect((await readFile(request.markerPath, 'utf8')).length).toBeGreaterThan(0)
+    expect(existsSync(requestPath(id))).toBe(false)
+    // Both sacrificial processes are gone: the supervisor died before its host.
+    expect(isAlive(app.pid ?? 0)).toBe(false)
+    expect(isAlive(hostPid)).toBe(false)
   })
 })

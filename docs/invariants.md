@@ -80,13 +80,19 @@ either broken once or is one edit away from breaking.
     against that double can catch it — `strictServiceAccess` exists to close
     that hole. Keep the guarded direct read as a fallback: `ctx.get` is itself
     optional.
-13. **A supervised host is never relaunched by the helper.** If the host was
+13. **A supervised host is never relaunched underneath its supervisor — the
+    supervisor is taken down first and relaunched instead.** If the host was
     spawned with an IPC channel (`process.channel !== undefined` — how the
-    Desktop app starts it), something else owns its lifecycle. That supervisor
-    does not respawn an unexpected exit, but it *is* alive and it does start its
-    own host when the operator restarts the app. Relaunching first takes the web
-    port, so the supervisor's host dies of `listen EADDRINUSE` on every retry
-    until the orphan is killed by hand — three identical startup crashes and a
-    Task Manager visit, in the run that established this. Write the marker and
-    stop: the marker plus the durable watch wake the session whenever the host
-    comes back, however long that takes.
+    Desktop app starts it), something else owns its lifecycle. Relaunching the
+    host first takes the web port, so the supervisor's own host then dies of
+    `listen EADDRINUSE` on every retry until the orphan is killed by hand —
+    three identical startup crashes and a Task Manager visit, in the run that
+    established this. But leaving the supervisor alone is not enough either: it
+    answers any host exit with a modal dialog, so the operator still has to
+    click, which defeats the feature. Kill the supervisor's whole tree
+    **supervisor-first** — the app must be gone before its child's `close`
+    handler can run, because that handler calls `fail()` for *every* exit code
+    — then write the marker and relaunch the app with `ELECTRON_RUN_AS_NODE`
+    stripped so the GUI comes back and starts its own host. Only when the
+    supervisor cannot be relaunched that way does the guard fall back to
+    writing the marker and stopping.

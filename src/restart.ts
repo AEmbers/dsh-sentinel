@@ -88,6 +88,28 @@ export interface RestartRequest {
    * 0.0.0.0:19387` startup crashes.
    */
   readonly supervised?: boolean
+  /**
+   * The supervising process — the desktop app that parented this host. Set
+   * together with `supervisorRelaunch`, and only when the supervisor can
+   * actually be brought back (see below). The helper takes this whole tree down
+   * *including the supervisor itself*, and it does so supervisor-first: the app
+   * reacts to its host's exit by calling `this.fail()` in the child's `close`
+   * handler, and no exit code avoids that — the only way to keep the modal
+   * dialog off the screen is for the app to be gone before it can run.
+   */
+  readonly supervisorPid?: number
+  /**
+   * How to bring the supervisor back, as argv. The helper strips
+   * `ELECTRON_RUN_AS_NODE` (inherited from the host, which *is* Electron running
+   * as Node) and launches this detached, so the desktop app starts normally and
+   * spawns a host of its own — which binds the port and picks up the marker.
+   *
+   * `app.relaunch()` is the app's own restart, but nothing outside the app can
+   * invoke it, and a second launch is only routed to `second-instance`, which
+   * focuses the running window instead of restarting anything. Killing and
+   * relaunching is therefore the whole of the automatic path.
+   */
+  readonly supervisorRelaunch?: readonly string[]
   readonly idleTimeoutMs: number
   readonly respawnGraceMs: number
 }
@@ -238,19 +260,31 @@ try {
   await sleep(settleMs)
 
   // 2. Kill the host and everything it spawned, but never our own subtree.
-  const victims = collectDescendants(request.hostPid).filter((pid) => pid !== process.pid)
-  await log('killing host descendants: [' + victims.join(',') + '] then pid ' + String(request.hostPid))
+  //    When a supervisor is recorded we take its whole tree instead — and take
+  //    the supervisor FIRST. The Desktop app answers its host's exit from the
+  //    child close handler by calling this.fail(), and it does that for EVERY
+  //    exit code, so no graceful shutdown keeps the modal dialog off the
+  //    screen. Killing the app before the host is the only thing that does.
+  const rootPid = request.supervisorPid === undefined ? request.hostPid : request.supervisorPid
+  const victims = collectDescendants(rootPid).filter((pid) => pid !== process.pid)
+  await log((request.supervisorPid === undefined ? 'killing host descendants: [' : 'killing supervisor tree: [') + victims.join(',') + '] then pid ' + String(rootPid))
+  if (request.supervisorPid !== undefined) {
+    try { process.kill(rootPid) } catch (error) { await log('supervisor kill failed: ' + String(error)) }
+  }
   for (const pid of victims.reverse()) {
     try { process.kill(pid) } catch { /* already gone */ }
   }
-  try { process.kill(request.hostPid) } catch (error) { await log('host kill failed: ' + String(error)) }
+  if (request.supervisorPid === undefined) {
+    try { process.kill(request.hostPid) } catch (error) { await log('host kill failed: ' + String(error)) }
+  }
 
-  // 3. Confirm the host actually died. Marker-writes are only meaningful once
-  //    the old prober is gone; otherwise the stale host would fire the wakeup
-  //    against a restart that never happened.
-  for (let waited = 0; waited < 10000 && isAlive(request.hostPid); waited += 250) await sleep(250)
-  if (isAlive(request.hostPid)) {
-    await log('host still alive after 10s; aborting without writing the marker')
+  // 3. Confirm the host, and any supervisor, actually died. Marker-writes are
+  //    only meaningful once the old prober is gone; otherwise the stale host
+  //    would fire the wakeup against a restart that never happened.
+  const supervisorAlive = () => request.supervisorPid !== undefined && isAlive(request.supervisorPid)
+  for (let waited = 0; waited < 10000 && (isAlive(request.hostPid) || supervisorAlive()); waited += 250) await sleep(250)
+  if (isAlive(request.hostPid) || supervisorAlive()) {
+    await log('host or supervisor still alive after 10s; aborting without writing the marker')
     await unlink(requestFile).catch(() => {})
     process.exit(1)
   }
@@ -273,8 +307,34 @@ try {
   await sleep(request.respawnGraceMs)
   if (await hostAnswers(request)) {
     await log('host came back on its own; not relaunching')
+  } else if (request.supervisorRelaunch !== undefined) {
+    // The supervisor went down with the host, so nothing brings it back but us.
+    // Its own app.relaunch() is unreachable from outside, and a second launch
+    // is only routed to second-instance, which focuses the running window. So
+    // the app is relaunched here, and it starts a host of its own.
+    const argv = request.supervisorRelaunch
+    await log('relaunching the supervising app: ' + argv.join(' '))
+    const appEnv = { ...process.env }
+    delete appEnv.ELECTRON_RUN_AS_NODE
+    const app = spawn(argv[0], argv.slice(1), {
+      cwd: dirname(argv[0]),
+      env: appEnv,
+      detached: true,
+      windowsHide: true,
+      stdio: 'ignore',
+    })
+    app.unref()
+    // The port probe is only meaningful when the request carried one.
+    if (request.port !== undefined) {
+      let up = false
+      for (let waited = 0; waited < 30000 && !up; waited += 1000) {
+        await sleep(1000)
+        up = await hostAnswers(request)
+      }
+      await log(up ? 'supervising app is back and serving' : 'supervising app did not serve within 30s')
+    }
   } else if (request.supervised === true) {
-    await log('host is supervised and the supervisor has not brought it back; not relaunching. Restart the app that owns this host — the wakeup marker is already written and the watch survives the wait.')
+    await log('host is supervised but the supervisor cannot be relaunched from here; not relaunching. Restart the app that owns this host — the wakeup marker is already written and the watch survives the wait.')
   } else if (request.command !== undefined) {
     await log('relaunching via shell command: ' + request.command)
     const child = spawn(request.command, {

@@ -364,6 +364,9 @@ interface PendingRestart {
   /** The host is supervised (spawned with an IPC channel), so the helper will
    * leave the host's return to the supervisor instead of binding the port. */
   readonly supervised: boolean
+  /** …and the supervisor is the desktop app itself, which the helper can take
+   * down and relaunch, so the whole cycle stays automatic. */
+  readonly relaunchSupervisor: boolean
   /** Writes the go file that lets the helper proceed; idempotent. */
   readonly release: () => void
 }
@@ -930,6 +933,11 @@ class SentinelRuntime {
       // does not respawn an unexpected exit, but it stays alive and owns the
       // port, so the helper must not relaunch underneath it.
       const supervised = process.channel !== undefined
+      // Under Electron-as-Node — which is how the desktop host runs —
+      // `process.execPath` IS the desktop app, so the supervisor can be brought
+      // back by launching that same binary bare. Under plain Node it cannot,
+      // and the helper falls back to refusing.
+      const relaunchSupervisor = supervised && process.versions['electron'] !== undefined
       request = {
         version: 1,
         id,
@@ -943,6 +951,9 @@ class SentinelRuntime {
         cwd,
         ...(port !== undefined ? { port } : {}),
         ...(supervised ? { supervised: true } : {}),
+        ...(relaunchSupervisor
+          ? { supervisorPid: process.ppid, supervisorRelaunch: [process.execPath] }
+          : {}),
         idleTimeoutMs,
         respawnGraceMs: this.config.restartRespawnGraceMs,
       }
@@ -962,6 +973,7 @@ class SentinelRuntime {
       markerPath: marker,
       relaunch: relaunchText,
       supervised: request.supervised === true,
+      relaunchSupervisor: request.supervisorRelaunch !== undefined,
       release: () => {
         if (released) return
         released = true
@@ -1358,6 +1370,7 @@ const RESTART_OUTPUT_SCHEMA = {
     markerPath: { type: 'string', required: true },
     idleTimeoutSeconds: { type: 'integer', required: true },
     supervised: { type: 'boolean', required: true },
+    relaunchSupervisor: { type: 'boolean', required: true },
   },
 } as const
 
@@ -1559,20 +1572,25 @@ function registerSentinelTools(runtime: SentinelRuntime, toolCtx: ContextLike, a
     },
     output: {
       schema: RESTART_OUTPUT_SCHEMA,
-      render: (_args: unknown, value: { requestId: string; watchId: string; relaunch: string; markerPath: string; idleTimeoutSeconds: number; supervised: boolean }) =>
+      render: (_args: unknown, value: { requestId: string; watchId: string; relaunch: string; markerPath: string; idleTimeoutSeconds: number; supervised: boolean; relaunchSupervisor: boolean }) =>
         textBlock([
           `重启交接已就绪: ${value.requestId}（哨兵订阅 ${value.watchId}）`,
           `重启命令: ${value.relaunch}`,
           `唤醒标记: ${value.markerPath}`,
           `守卫进程会等本回合结束（最多 ${String(value.idleTimeoutSeconds)}s）后杀掉 dsh 宿主。`,
-          ...(value.supervised
+          ...(value.relaunchSupervisor
             ? [
-                '这个宿主受一个监督者管理（它是带 IPC 通道的子进程，桌面 App 就是这样启动它的），所以守卫**不会**自己拉起宿主：那会先占住 web 端口，让监督者重启时自己的宿主撞上 EADDRINUSE，之后每次重试都失败，直到有人手动杀掉那个野宿主。',
-                '请在 App 的「应用无法启动或已意外停止」对话框里点「重启应用」（或者干脆关掉 App 重开）。新宿主一上来就会认领唤醒标记并叫醒本会话——标记已经写好，订阅是持久的，等多久都不会丢。',
+                '这个宿主由桌面 App 监督（它是带 IPC 通道的子进程）。守卫会把 **App 连同宿主一起** 关掉——顺序是先杀 App，因为 App 对宿主退出**任何**退出码都会弹「应用无法启动或已意外停止」对话框，只有抢在它之前动手才能不弹框。',
+                '然后守卫会自己把 App 重新拉起来（把继承来的 ELECTRON_RUN_AS_NODE 剥掉，所以起来的是正常 GUI）。新 App 会启动它自己的宿主、绑定端口、认领唤醒标记并叫醒本会话。**你不需要点任何东西**——窗口会自己关掉再自己回来。',
               ]
-            : [
-                `监督者没有把宿主拉起来，守卫会自己 relaunch 一份，重启完成后哨兵会把这个会话唤醒并交回你的便签。`,
-              ]),
+            : value.supervised
+              ? [
+                  '这个宿主受监督者管理（带 IPC 通道），但监督者不是可以在这里重新拉起的桌面 App，所以守卫只写标记、不拉起任何东西：抢在监督者前面绑端口会让它在 EADDRINUSE 上反复失败。',
+                  '请手动重启那个监督者——标记已经写好、订阅是持久的，宿主什么时候回来，唤醒就什么时候触发。',
+                ]
+              : [
+                  '守卫会自己 relaunch 一份宿主，重启完成后哨兵会把这个会话唤醒并交回你的便签。',
+                ]),
           '现在立刻结束本回合：回合结束后的任何操作都会被重启截断。',
         ].join('\n')),
     },
@@ -1594,6 +1612,7 @@ function registerSentinelTools(runtime: SentinelRuntime, toolCtx: ContextLike, a
         markerPath: pending.markerPath,
         idleTimeoutSeconds: Math.round(idleTimeoutMs / 1000),
         supervised: pending.supervised,
+        relaunchSupervisor: pending.relaunchSupervisor,
       }
     },
   })))
