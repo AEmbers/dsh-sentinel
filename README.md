@@ -125,7 +125,10 @@ Verified against these harness versions (plugin loads, duty lease is held, web r
   where a file watch's first probe had to land before the watched file appeared — the assertion was really
   "the scheduler was kind", so they now poll the durable sidecar row instead. Measured across 29 consecutive
   full-suite runs after the change: one failure that never reproduced (in a run overlapping a concurrent
-  build), against roughly one failing run in three before
+  build), against roughly one failing run in three before. The harness imports also moved from `dependencies`
+  to `peerDependencies` — see "Why the harness imports are peers" below, which is what clears the dsh-market
+  host-dependency warning and stops the plugin reserving `@deepseek-ai/dsh-tools` and `dsh-llm` away from the
+  host
 - `0.1.7-rc.2` — 2026-09-29, clean-profile upgrade rehearsal against a copy of the live profile: 0.1.7 removed the shared catch-all `plugin` message-source kind (every producer now declares its own), so a wakeup carries `{ kind: 'sentinel' }` — same `context` placement in the transcript, and it renders as "Sentinel" on both lines. The harness dependency range was also re-pinned to the 0.1.7 line, because under strict semver `>=0.1.5-rc.2 <0.2.0` does **not** admit `0.1.7-rc.2` (the prerelease rule); left alone, a 0.1.7 host would have resolved this plugin's harness imports to 0.1.5 copies — the exact drift the 0.1.5 alignment removed. Verified: `pnpm typecheck` and all 63 tests pass, the plugin activates and holds the duty lease, the web routes answer, and the served client bundle carries `sidebar.panellist` (65 boot rows)
 - `0.1.5-rc.2` — 2026-09-15, live web deployment after the 0.1.5 alignment: the plugin's whole runtime import closure resolves to the deployed line (its harness imports are declared dependencies, so a profile's older hoisted copies can no longer shadow them), the client half builds against the real 0.1.5 types with no shims, `pnpm typecheck` and all 63 tests pass, and a live file watch fired through inotify 1s after the change and the wakeup was delivered into the session as a plugin-sourced message; after the restart the deployment serves the new client half (bundle rev changed, `sidebar.panellist` present, 54 boot rows)
 - `0.1.5-alpha.2` — 2026-09-09, temporary web-profile smoke: Node plugin load, duty lease, state/dashboard routes, and the browser plugin bundle all worked with no browser-console errors; `conversation.input.dock` remains a supported session-scoped list slot, and the plugin sidecar is unaffected by the Session V3 migration
@@ -133,7 +136,21 @@ Verified against these harness versions (plugin loads, duty lease is held, web r
 - `0.1.0-rc.8` — 2026-08-20, scratch-profile smoke
 - `0.1.0-rc.7` — 2026-08-20, live web deployment
 
-Compatibility means the cordis loader entries, the `ctx.agents` followup channel, the declared slot seats, and the web routes keep working; file an issue if a harness version breaks any of them. Its harness imports (`@deepseek-ai/dsh-tools`, `@deepseek-ai/dsh-llm`, `@deepseek-ai/dsh-scope`) are declared dependencies pinned to the verified line, so the plugin carries aligned copies instead of inheriting whatever a profile's hoisted store happens to hold; `@deepseek-ai/cordis` stays a peer because service identity must come from the running host.
+Compatibility means the cordis loader entries, the `ctx.agents` followup channel, the declared slot seats, and the web routes keep working; file an issue if a harness version breaks any of them.
+
+### Why the harness imports are peers, not dependencies
+
+`@deepseek-ai/dsh-tools` and `@deepseek-ai/dsh-llm` are the two host packages this plugin imports at runtime (`defineTool`, `createUserMessage`), and they are declared as **peerDependencies**. That is not cosmetic.
+
+`dsh-app-boot`'s `createRuntimeResolution` builds the resolution table plugins load through from two scopes: the installation anchor (the host's own `@deepseek-ai/*` copies) and the profile. `installedProfilePackageNames` collects the profile's direct dependencies that exist on disk — described in its own comment as "installed direct dependencies that Node resolves before profile fallback" — and passes them as `reserved`, which **drops those names from the host's side of the table**. Node resolves them from the profile first regardless. So a plugin that declares a host core package as an ordinary dependency does not merely carry a second copy: it takes the name away from the host for the rest of the profile.
+
+dsh-market documents the observed result and puts exactly these names in `KNOWN_SHARED_HOST_PACKAGES`: "the dsh-excel-chat failure mode where the plugin's copy gets hoisted to the profile root and shadows the host's version (tool calls die, minimal preset fails to mount)". Installing this plugin the old way put `@deepseek-ai/dsh-llm`, `dsh-tools` and `dsh-scope` plus six transitive packages at the profile root, in precisely that configuration.
+
+Declaring them as peers binds the plugin to the host's single instance and lets DSH's own compatibility checker compare the peer range against the running host, so a version gap becomes a visible warning instead of silent drift. They stay in `devDependencies` so this repo still typechecks and builds standalone. `@deepseek-ai/dsh-scope` was dropped outright — nothing imported it.
+
+> This reverses the reasoning the 0.1.5/0.1.7 notes above record, which made the imports *dependencies* so a profile's hoisted copies could not shadow them. That concern was real, but it was aimed at undeclared resolution; declaring the peer is the correct form of the same intent, and the dependency form carries a cost those notes did not account for.
+
+Verified by cold-loading: a throwaway `headless` profile with this plugin installed, **no** `@deepseek-ai/dsh-tools` or `dsh-llm` anywhere in its `node_modules`, boots and answers `sentinel_list` — the host supplies both packages through the resolution table.
 
 ## Install
 

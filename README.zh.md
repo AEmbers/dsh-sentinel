@@ -115,7 +115,9 @@ Node 侧持有一个与 server 同生命周期的运行时：把插件自己的 
   「单一 owner」的保证在每个周期里有约 20% 时间**按构造就不成立**（运行时现在会直接拒绝这种配置）；
   另有几处测试用固定 sleep 等「file watch 的第一次探测必须在被监视文件出现之前落地」，
   断言的其实是「调度器赏脸」——现在改为轮询 sidecar 里那条持久化基线行。改动后连续 29 轮全量跑里只有 1 轮失败、
-  且之后 20 轮再没复现（那一轮与一次并发构建重叠），改动前大约 3 轮里就有 1 轮失败
+  且之后 20 轮再没复现（那一轮与一次并发构建重叠），改动前大约 3 轮里就有 1 轮失败。harness import 也从
+  `dependencies` 改成了 `peerDependencies`——见下面「为什么 harness 依赖是 peer 而不是 dependency」，
+  这正是消除 dsh-market 那条宿主依赖警告、并让插件不再把 `@deepseek-ai/dsh-tools` / `dsh-llm` 从宿主手里占走的原因
 - `0.1.7-rc.2` —— 2026-09-29，对线上 profile 的副本做整轮净装升级彩排：0.1.7 删除了共享的兜底 `plugin` 消息来源 kind（改为每个生产者声明自己的），因此唤醒携带 `{ kind: 'sentinel' }`——在会话流里落位同为 `context`，两条版本线上都渲染为 "Sentinel"。harness 依赖范围也重新钉到 0.1.7 线：严格 semver 下 `>=0.1.5-rc.2 <0.2.0` **不包含** `0.1.7-rc.2`（预发布规则），若不改，0.1.7 宿主会把本插件的 harness import 解析到 0.1.5 的副本——正是 0.1.5 对齐时消除掉的那类漂移。实测：`pnpm typecheck` 与全部 63 个测试通过，插件激活并持有 duty 租约，web 路由应答正常，下发的客户端 bundle 含 `sidebar.panellist`（boot 图 65 条）
 - `0.1.5-rc.2` —— 2026-09-15，对齐 0.1.5 后的正式 web 部署实测：插件整条运行时 import 闭包都解析到部署线（harness 依赖改为显式 dependencies，profile 里更旧的 hoisted 副本再也遮不住它们），客户端半侧去掉 shim 后按真实 0.1.5 类型构建，`pnpm typecheck` 与全部 63 个测试通过，线上文件 watch 在改动后 1s 内经 inotify 触发，唤醒作为 plugin 来源的会话消息投递进会话；重启后部署下发的是新的客户端半侧（bundle rev 变更、含 `sidebar.panellist`、boot 图 54 条）
 - `0.1.5-alpha.2` —— 2026-09-09，临时 web profile 实测：Node 插件加载、duty 租约、state/dashboard 路由和浏览器插件 bundle 均正常，浏览器控制台无报错；`conversation.input.dock` 仍是有效的会话级 list slot，插件 sidecar 不受 Session V3 迁移影响
@@ -123,7 +125,23 @@ Node 侧持有一个与 server 同生命周期的运行时：把插件自己的 
 - `0.1.0-rc.8` —— 2026-08-20，scratch profile 冒烟
 - `0.1.0-rc.7` —— 2026-08-20，正式 web 部署
 
-这里的兼容指 cordis loader 条目、`ctx.agents` 跟进通道、所声明的 slot 座位和 web 路由持续可用；若某版本破坏了其中任一环节，请提 issue。插件的 harness 依赖（`@deepseek-ai/dsh-tools`、`@deepseek-ai/dsh-llm`、`@deepseek-ai/dsh-scope`）是钉在已验证版本线上的显式 dependencies，插件因此自带对齐副本，而不是继承 profile 里 hoisted store 恰好留下的版本；`@deepseek-ai/cordis` 仍是 peer，因为服务身份必须来自正在运行的宿主。
+这里的兼容指 cordis loader 条目、`ctx.agents` 跟进通道、所声明的 slot 座位和 web 路由持续可用；若某版本破坏了其中任一环节，请提 issue。
+
+### 为什么 harness 依赖是 peer 而不是 dependency
+
+`@deepseek-ai/dsh-tools` 和 `@deepseek-ai/dsh-llm` 是本插件运行时真正 import 的两个宿主包（`defineTool`、`createUserMessage`），它们声明为 **peerDependencies**。这不是表面功夫。
+
+`dsh-app-boot` 的 `createRuntimeResolution` 会从两个 scope 构建插件加载时的解析表：installation anchor（宿主自带的 `@deepseek-ai/*` 副本）和 profile。而 `installedProfilePackageNames` 会收集 profile 里**实际存在于磁盘上的直接依赖**——它自己的注释写得很清楚：「installed direct dependencies that Node resolves before profile fallback」——并把它们当作 `reserved`，于是这些名字会**从宿主那一半的解析表里被抹掉**。何况 Node 本来就会先解析 profile 里那份。
+
+所以插件把宿主核心包声明成普通 dependency，并不只是多带了一份副本：它等于**把这个名字从宿主手里抢走**，profile 里其他所有消费者都受影响。
+
+dsh-market 记录了这个真实观测到的后果，并把这几个名字列进 `KNOWN_SHARED_HOST_PACKAGES`：「the dsh-excel-chat failure mode where the plugin's copy gets hoisted to the profile root and shadows the host's version（tool calls die, minimal preset fails to mount）」。旧装法正是把 `@deepseek-ai/dsh-llm`、`dsh-tools`、`dsh-scope` 连同六个传递依赖一起放到了 profile 根目录，正好落在这个模式里。
+
+改成 peer 之后，插件绑定到宿主那唯一的实例，同时 DSH 自己的兼容性检查器会拿 peer 范围去核对正在运行的宿主——版本差距从「静默漂移」变成「可见警告」。它们仍留在 `devDependencies` 里，所以本仓库单独 typecheck / build 不受影响。`@deepseek-ai/dsh-scope` 直接删掉了：没有任何地方 import 它。
+
+> 这一条**推翻了**上面 0.1.5 / 0.1.7 记录里的推理——那两版特意把 harness import 做成 *dependencies*，就是为了不让 profile 里 hoisted 的副本遮蔽它们。那个担忧是真实的，但它是冲着「未声明的解析」去的；声明成 peer 才是同一意图的正确写法，而 dependency 那种写法带着那两版记录没有考虑到的代价。
+
+冷加载实测：一个全新的 `headless` profile，装上本插件，`node_modules` 里**完全没有** `@deepseek-ai/dsh-tools` / `dsh-llm`，照样能启动，`sentinel_list` 也能调用——这两个包由宿主经解析表提供。
 
 ## 安装
 

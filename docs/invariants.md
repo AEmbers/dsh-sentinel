@@ -54,3 +54,15 @@ either broken once or is one edit away from breaking.
    exception any `try` can catch — on such a path, so a mistake here takes down
    the whole harness, not just the watch. Falling back to heartbeat polling is
    always the correct failure mode.
+10. **Never declare a DSH host core package as an ordinary dependency.**
+    `@deepseek-ai/dsh-tools`, `dsh-llm`, `dsh-scope`, `cordis`, `dsh-attachment`
+    and `dsh-system-prompt` are host contracts and belong in
+    `peerDependencies` (plus `devDependencies` so this repo still builds).
+    `dsh-app-boot`'s `createRuntimeResolution` reserves every profile-installed
+    direct dependency, which **removes that name from the host's half of the
+    resolution table**; Node resolves the profile copy first regardless. The
+    plugin does not just carry a second copy — it takes the host's identity
+    away from every other consumer in the profile. This is the dsh-excel-chat
+    failure mode dsh-market reports as "tool calls die, minimal preset fails to
+    mount". Cold-load proof: a headless profile with this plugin installed and
+    no local `@deepseek-ai/dsh-tools`/`dsh-llm` boots and serves its tools.
