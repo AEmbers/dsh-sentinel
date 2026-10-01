@@ -507,11 +507,45 @@ class SentinelRuntime {
     }
   }
 
+  /**
+   * The web server's port, read through the NON-injecting accessor.
+   *
+   * `webServer` is deliberately absent from this plugin's inject list — a
+   * headless profile has no web server, and injecting it would stall activation
+   * there — so reaching for `ctx.webServer` directly throws
+   * `cannot get property "webServer" without inject` on the real host even
+   * though the service is mounted and the routes are serving. A ctx faked as a
+   * plain object (as every test here does) never reproduces that, which is how
+   * the direct access survived until a live `sentinel_restart` hit it.
+   *
+   * A port is a convenience — the webhook URL, the restart helper's respawn
+   * probe — and never load-bearing, so every failure path degrades to
+   * `undefined` rather than taking a watch or a restart down with it.
+   *
+   * `ctx.get` is itself optional in the host surface, and a context assembled
+   * as a plain object exposes the service only as a property, so the direct
+   * read stays as a guarded fallback rather than being replaced outright.
+   */
+  private webPort(): number | undefined {
+    let server: { port?: unknown } | undefined
+    try {
+      server = this.ctx.get?.('webServer') as { port?: unknown } | undefined
+    } catch { /* no non-injecting accessor; fall back to the property */ }
+    if (typeof server?.port !== 'number') {
+      try {
+        server = this.ctx.webServer as { port?: unknown } | undefined
+      } catch {
+        server = undefined
+      }
+    }
+    return typeof server?.port === 'number' ? server.port : undefined
+  }
+
   /** Absolute webhook URL when the web server port is known; bare path in
    * headless (no webServer), where nothing listens anyway. The session
    * qualifier disambiguates watch ids, which are allocated per session. */
   hookUrl(sessionId: string, id: string): string {
-    const port = this.ctx.webServer?.port
+    const port = this.webPort()
     const path = `${HOOK_PATH}?id=${id}&s=${encodeURIComponent(sessionId)}`
     return port === undefined ? path : `http://localhost:${String(port)}${path}`
   }
@@ -881,27 +915,31 @@ class SentinelRuntime {
       this.config.defaultCooldownSeconds,
     )
 
-    const request: RestartRequest = {
-      version: 1,
-      id,
-      hostPid: process.pid,
-      sessionId,
-      watchId: subscription.id,
-      goPath: goPath(id),
-      markerPath: marker,
-      logPath: join(restartDir(), `helper-${id}.log`),
-      ...(command !== undefined ? { command } : { argv: derived?.argv ?? [] }),
-      cwd,
-      ...(this.ctx.webServer?.port !== undefined ? { port: this.ctx.webServer.port } : {}),
-      idleTimeoutMs,
-      respawnGraceMs: this.config.restartRespawnGraceMs,
-    }
+    // Everything after the registration lives inside ONE try: an armed watch
+    // whose helper never starts would probe a marker nobody will ever write,
+    // for as long as this host lives. The port read in particular used to sit
+    // outside and throw on the real host, orphaning exactly such a watch.
+    let request: RestartRequest
     try {
+      const port = this.webPort()
+      request = {
+        version: 1,
+        id,
+        hostPid: process.pid,
+        sessionId,
+        watchId: subscription.id,
+        goPath: goPath(id),
+        markerPath: marker,
+        logPath: join(restartDir(), `helper-${id}.log`),
+        ...(command !== undefined ? { command } : { argv: derived?.argv ?? [] }),
+        cwd,
+        ...(port !== undefined ? { port } : {}),
+        idleTimeoutMs,
+        respawnGraceMs: this.config.restartRespawnGraceMs,
+      }
       await this.primeBaseline(sessionId, subscription.id)
       await spawnRestartHelper(request)
     } catch (error: unknown) {
-      // Never leave a watch behind whose marker nobody will ever write: it
-      // would probe a file that cannot appear, for as long as the host lives.
       await this.cancel(sessionId, subscription.id, 'agent').catch(() => {})
       throw error
     }

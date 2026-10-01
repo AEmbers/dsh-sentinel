@@ -8,7 +8,7 @@ import { apply, CANCEL_PATH, DEFAULT_CONFIG, HOOK_PATH, STATE_PATH, storePath } 
 
 /** Minimal structural doubles for the host surfaces the plugin touches. */
 
-function makeHarness(resumable: string[] = [], options: { headless?: boolean } = {}) {
+function makeHarness(resumable: string[] = [], options: { headless?: boolean; strictServiceAccess?: boolean } = {}) {
   const followups: string[] = []
   // The wakeup's message-source attribution: 0.1.7 dropped the shared
   // `plugin` kind, so the contract we must hold is our own declared kind.
@@ -79,8 +79,9 @@ function makeHarness(resumable: string[] = [], options: { headless?: boolean } =
       },
     },
   }
+  const scopedCtx: Record<string, unknown> = { ...rootCtx }
   if (options.headless !== true) {
-    rootCtx['webServer'] = {
+    scopedCtx['webServer'] = {
       port: 3080,
       register(route: { path: string; handler: (req: unknown, res: unknown) => void }) {
         routes.push(route)
@@ -88,10 +89,28 @@ function makeHarness(resumable: string[] = [], options: { headless?: boolean } =
       },
     }
   }
-  // Cordis dynamic-injection double: fires only when the service exists.
-  rootCtx['inject'] = (_deps: string[], callback: (ctx: unknown) => void) => {
-    if (options.headless !== true) callback(rootCtx)
-    return () => {}
+  if (options.strictServiceAccess === true) {
+    // Cordis refuses to hand an un-injected service off a context — reading one
+    // throws `cannot get property "..." without inject` — while `ctx.get(name)`
+    // and the injected scope both expose it. The plain-object ctx this harness
+    // uses by default lets a direct read succeed, which is precisely how a
+    // `ctx.webServer` access survived all the way into a live sentinel_restart.
+    rootCtx['get'] = (name: string) => (name === 'webServer' ? scopedCtx['webServer'] : undefined)
+    Object.defineProperty(rootCtx, 'webServer', {
+      configurable: true,
+      get() { throw new Error('cannot get property "webServer" without inject') },
+    })
+    rootCtx['inject'] = (_deps: string[], callback: (ctx: unknown) => void) => {
+      if (options.headless !== true) callback(scopedCtx)
+      return () => {}
+    }
+  } else {
+    if (options.headless !== true) rootCtx['webServer'] = scopedCtx['webServer']
+    // Cordis dynamic-injection double: fires only when the service exists.
+    rootCtx['inject'] = (_deps: string[], callback: (ctx: unknown) => void) => {
+      if (options.headless !== true) callback(rootCtx)
+      return () => {}
+    }
   }
 
   return { agent, followups, sources, tools, routes, cleanups, rootCtx, live, resumeCalls, emit }
@@ -712,6 +731,29 @@ describe('sentinel end-to-end (in-process)', () => {
     if (listTool === undefined) throw new Error('list tool missing')
     const listed = await listTool.execute({}, {}) as { subscriptions: Array<{ id: string }> }
     expect(listed.subscriptions.map(sub => sub.id)).toContain('watch-1')
+  })
+
+  it('reads the web port through the non-injecting accessor, never ctx.webServer', async () => {
+    // The regression this pins: `webServer` is deliberately absent from the
+    // plugin's inject list, so on a real cordis context a direct `ctx.webServer`
+    // read throws `cannot get property "webServer" without inject`. A live
+    // sentinel_restart died on exactly that AFTER registering its watch, which
+    // orphaned a probe for a marker nobody would ever write.
+    await freshHome()
+    const harness = makeHarness([], { strictServiceAccess: true })
+    harnesses.push(harness)
+    apply(harness.rootCtx as never)
+    harness.emit('agent/created', { agent: harness.agent })
+
+    const watchTool = harness.tools.find(tool => tool.name === 'sentinel_watch')
+    if (watchTool === undefined) throw new Error('watch tool missing')
+    const created = await watchTool.execute({
+      kind: 'webhook',
+      target: 'ci',
+      note: 'strict service access',
+      interval_seconds: 30,
+    }, {}) as { id: string; hookPath?: string }
+    expect(created.hookPath).toBe(`http://localhost:3080${HOOK_PATH}?id=${created.id}&s=session-e2e`)
   })
 
   it('honors a tighter maxSubscriptionsPerSession from config', async () => {
