@@ -160,6 +160,23 @@ child.once("close", (code) => {
 
 对于无法这样拉起的监督者（普通 Node 跑在带 IPC 的父进程下），仍然沿用 v0.13.4 的处理：写标记、不碰端口、告诉操作员自己去重启它。
 
+**在真实桌面宿主上实测过。** 宿主 27692，由 App 4328 监督：
+
+```
+12:57:29.526Z helper started (pid 30404), target host pid 27692
+12:57:35.669Z agent reported idle
+12:57:38.098Z killing supervisor tree: [12 个 pid] then pid 4328
+12:57:38.100Z host pid 27692 is gone
+12:57:38.102Z marker written: …\ready-27692-mupjh6yv.flag
+12:57:46.118Z relaunching the supervising app: …\DeepSeek Harness.exe
+12:57:50.165Z supervising app is back and serving
+12:57:50.166Z helper done
+```
+
+- `killing supervisor tree … then pid 4328` 里写的是 **App 的 pid**，不是宿主的：App 才是被拿下的那棵树的根，宿主 27692 只是它十二个后代之一。
+- 又一次 8.016 秒的 `restartRespawnGraceMs`，然后把 App 以裸参数重新拉起。它 **4.05 秒**后就已经回来并在服务了——它启动了自己的宿主（pid 8428，父进程是早已退出的守卫），那个宿主接管 duty 租约并触发了对原会话的唤醒。
+- **崩溃报告目录一份都没多。** v0.13.4 那次留下 1 份 `phase: running` 的报告（App 察觉到宿主被杀）；这次一份都没有，因为 App 在它的 `close` 处理函数有机会运行之前就已经没了——那张模态对话框从未存在过，所以也没有任何东西需要应答。从 idle 边沿到宿主恢复服务大约十二秒半，操作员动作数为零。
+
 ## 路由
 
 - `GET /plugins/dsh-sentinel/state?sessionId=…` — dock 和侧边栏面板用的只读状态（省略 `sessionId` 返回所有会话）。

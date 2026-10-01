@@ -200,6 +200,29 @@ So the helper now takes the supervisor down **first**, then its host, and relaun
 A supervisor that cannot be relaunched this way (plain Node under an IPC-speaking parent) still gets the
 v0.13.4 treatment: marker written, port left alone, operator told to restart it.
 
+**Verified on the live desktop host.** Host 27692, supervised by app 4328:
+
+```
+12:57:29.526Z helper started (pid 30404), target host pid 27692
+12:57:35.669Z agent reported idle
+12:57:38.098Z killing supervisor tree: [12 pids] then pid 4328
+12:57:38.100Z host pid 27692 is gone
+12:57:38.102Z marker written: …\ready-27692-mupjh6yv.flag
+12:57:46.118Z relaunching the supervising app: …\DeepSeek Harness.exe
+12:57:50.165Z supervising app is back and serving
+12:57:50.166Z helper done
+```
+
+- `killing supervisor tree … then pid 4328` names the **app**, not the host: the app is the root being taken
+  down and host 27692 is one of its twelve descendants.
+- 8.016 s of `restartRespawnGraceMs` again, then the app is relaunched bare. It is back and serving **4.05 s**
+  later, having started a host of its own (pid 8428, parented to the since-exited helper) that claimed the duty
+  lease and fired the wakeup into the originating session.
+- **The crash-report directory gains nothing at all.** The v0.13.4 run left one `phase: running` report — the
+  app noticing its host was killed. This run leaves none, because the app was gone before its `close` handler
+  could run: the modal dialog never existed, so there was nothing to answer. Roughly twelve and a half seconds
+  from the idle edge to a serving host, with zero operator actions.
+
 ## Routes
 
 - `GET /plugins/dsh-sentinel/state?sessionId=…` — read-only state for the dock and the sidebar panel (omit `sessionId` for every session).
