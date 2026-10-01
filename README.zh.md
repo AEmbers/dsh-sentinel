@@ -88,6 +88,36 @@ Node 侧持有一个与 server 同生命周期的运行时：把插件自己的 
 因为杀进程发生在 idle 边沿，请把 `sentinel_restart` 放在回合最后调用，然后**立刻结束回合**——之后的任何操作都会被截断。
 它会带走整个 dsh 宿主：它服务的每个会话，以及任何占着端口的插件。这里的「重启」就是这个意思。
 
+### 真实桌面宿主上的端到端实测
+
+环境：Windows / DSH 0.2.0-rc.2 / desktop profile。这次交接的守卫日志
+（`$DSH_HOME/sentinel-restart/helper-<id>.log`）原文是：
+
+```
+07:32:55.587Z helper started (pid 39392), target host pid 28252
+07:32:55.606Z handed off to stage 2 (pid 3556)
+07:33:00.217Z agent reported idle
+07:33:02.869Z killing host descendants: [26 个 pid] then pid 28252
+07:33:02.872Z host pid 28252 is gone
+07:33:02.873Z marker written: …\ready-28252-mup7vsr2.flag
+07:33:10.877Z relaunching: "<Electron exe>" --expose-internals "<…dsh-desktop-host\lib\index.js>" …
+07:33:10.889Z helper done
+```
+
+这一段锁定了这些事实：
+
+- 守卫随工具调用就启动，但**等了 4.6 秒**的 idle 边沿才动手——没有在回合还跑着的时候把宿主从底下抽走。
+- `killing host descendants` 是 26 个 pid，按深度逆序杀，并且排除守卫自己的进程树。
+- `marker written` 到 `relaunching` 之间的 **8.008 秒**正是 `restartRespawnGraceMs` 在干活：桌面 App 监督着自己的宿主，宿主意外退出时它只调 `this.fail()` 而**不会**重新拉起，所以宽限期过后发现没人监听端口，守卫就自己把宿主拉了起来。
+- 新宿主是**另一个 pid**（35684，父进程是早已退出的 stage-2 守卫——正如设计的那样处于 detached 状态），它接管了 duty 租约（`state` 里 `duty.pid === 35684`）、折叠了 sidecar、把标记落成基线，并把唤醒投递回了原来的会话。全程没有端口、没有 URL、没有就绪握手——标记文件就是全部接口。
+- 守卫打扫干净了：`request-<id>.json` 已删、`ready-<id>.flag` 留作记录、`helper-v1.mjs` 保留复用。
+
+**但那次「自己拉起宿主」对受监督的宿主来说是错的——这一跑就是发现它的方式。** 桌面 App 是宿主的*父*进程：杀宿主时它活了下来，弹出 `dsh desktop host stopped` 对话框，而且——关键在这里——操作员点「重启应用」时它会启动**它自己的**宿主。可我们那个 detached 替身已经占住了 `0.0.0.0:19387`，于是 App 的宿主撞上 `listen EADDRINUSE` 直接死掉，对话框再次弹出。连续三次尝试产生三份一模一样的崩溃报告（`07-33-36`、`07-33-50`、`07-34-05`），最后是在任务管理器里手动杀掉那个野宿主，端口才空出来。
+
+所以现在守卫**不会**在受监督的宿主下拉起任何东西，并且会在日志和工具回执里明说。`supervised` 的判定依据是宿主当初是被带 IPC 通道的方式启动的（`process.channel !== undefined`）——桌面 App 正是这样启动宿主（`stdio: [..., 'ipc']`），而 shell 或 headless 启动永远不会。受监督时正确的做法就是写好标记然后停手：宿主的生命周期归监督者所有，而标记加上持久订阅意味着无论操作员过多久才把宿主带回来，唤醒都会触发。
+
+桌面 App 窗口仍然是那一刀本身的代价——它是宿主的父进程，所以它会活下来并停在那张对话框上。在受监督模式下，这张对话框现在就是**预期中**的恢复入口：点「重启应用」（或者关掉 App 重开），App 会启动一个全新的宿主，它正常绑定端口、发现标记，然后唤醒你的会话。
+
 ## 路由
 
 - `GET /plugins/dsh-sentinel/state?sessionId=…` — dock 和侧边栏面板用的只读状态（省略 `sessionId` 返回所有会话）。

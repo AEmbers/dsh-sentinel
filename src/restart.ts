@@ -75,6 +75,19 @@ export interface RestartRequest {
   readonly cwd: string
   /** Web port the host served on, if known; used only to detect a supervised respawn. */
   readonly port?: number
+  /**
+   * True when the host was spawned with an IPC channel, i.e. something parented
+   * it and expects to supervise it — the Desktop app does exactly this
+   * (`stdio: [..., 'ipc']`). Such a supervisor owns the host's lifecycle and
+   * will not respawn it after an unexpected exit, but it *stays alive* and
+   * brings the host back when the operator restarts the app. Relaunching
+   * ourselves in that window is worse than doing nothing: the replacement binds
+   * the web port first, so the supervisor's own host then dies of EADDRINUSE
+   * and every retry fails until someone kills the orphan by hand. Observed for
+   * real — three consecutive `listen EADDRINUSE: address already in use
+   * 0.0.0.0:19387` startup crashes.
+   */
+  readonly supervised?: boolean
   readonly idleTimeoutMs: number
   readonly respawnGraceMs: number
 }
@@ -248,12 +261,20 @@ try {
   await writeFile(request.markerPath, new Date().toISOString() + '\\n', 'utf8')
   await log('marker written: ' + request.markerPath)
 
-  // 5. Give whatever launched us a chance to bring the host back on its own
-  //    (the desktop app supervises its host child). Only relaunch when nothing
-  //    else did, so the replacement is never doubled.
+  // 5. Give whatever launched us a chance to bring the host back on its own.
+  //    A supervisor (the Desktop app) does NOT respawn an unexpected exit: it
+  //    parks on a fatal dialog and waits for the operator. But it IS still
+  //    alive and owns the host, so relaunching here would take the web port
+  //    from the host that supervisor starts on restart — and every retry then
+  //    dies of EADDRINUSE until someone kills the orphan by hand. So never
+  //    relaunch under a supervisor. The marker is already written and the
+  //    watch is durable, so the wakeup fires whenever the host comes back,
+  //    however long the operator takes.
   await sleep(request.respawnGraceMs)
   if (await hostAnswers(request)) {
     await log('host came back on its own; not relaunching')
+  } else if (request.supervised === true) {
+    await log('host is supervised and the supervisor has not brought it back; not relaunching. Restart the app that owns this host — the wakeup marker is already written and the watch survives the wait.')
   } else if (request.command !== undefined) {
     await log('relaunching via shell command: ' + request.command)
     const child = spawn(request.command, {

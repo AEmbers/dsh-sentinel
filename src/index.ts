@@ -361,6 +361,9 @@ interface PendingRestart {
   readonly goPath: string
   readonly markerPath: string
   readonly relaunch: string
+  /** The host is supervised (spawned with an IPC channel), so the helper will
+   * leave the host's return to the supervisor instead of binding the port. */
+  readonly supervised: boolean
   /** Writes the go file that lets the helper proceed; idempotent. */
   readonly release: () => void
 }
@@ -922,6 +925,11 @@ class SentinelRuntime {
     let request: RestartRequest
     try {
       const port = this.webPort()
+      // An IPC channel means something parented this host and supervises it —
+      // the Desktop app spawns its host with stdio [..., 'ipc']. That supervisor
+      // does not respawn an unexpected exit, but it stays alive and owns the
+      // port, so the helper must not relaunch underneath it.
+      const supervised = process.channel !== undefined
       request = {
         version: 1,
         id,
@@ -934,6 +942,7 @@ class SentinelRuntime {
         ...(command !== undefined ? { command } : { argv: derived?.argv ?? [] }),
         cwd,
         ...(port !== undefined ? { port } : {}),
+        ...(supervised ? { supervised: true } : {}),
         idleTimeoutMs,
         respawnGraceMs: this.config.restartRespawnGraceMs,
       }
@@ -952,6 +961,7 @@ class SentinelRuntime {
       goPath: request.goPath,
       markerPath: marker,
       relaunch: relaunchText,
+      supervised: request.supervised === true,
       release: () => {
         if (released) return
         released = true
@@ -1347,6 +1357,7 @@ const RESTART_OUTPUT_SCHEMA = {
     relaunch: { type: 'string', required: true },
     markerPath: { type: 'string', required: true },
     idleTimeoutSeconds: { type: 'integer', required: true },
+    supervised: { type: 'boolean', required: true },
   },
 } as const
 
@@ -1548,12 +1559,20 @@ function registerSentinelTools(runtime: SentinelRuntime, toolCtx: ContextLike, a
     },
     output: {
       schema: RESTART_OUTPUT_SCHEMA,
-      render: (_args: unknown, value: { requestId: string; watchId: string; relaunch: string; markerPath: string; idleTimeoutSeconds: number }) =>
+      render: (_args: unknown, value: { requestId: string; watchId: string; relaunch: string; markerPath: string; idleTimeoutSeconds: number; supervised: boolean }) =>
         textBlock([
           `重启交接已就绪: ${value.requestId}（哨兵订阅 ${value.watchId}）`,
           `重启命令: ${value.relaunch}`,
           `唤醒标记: ${value.markerPath}`,
-          `守卫进程会等本回合结束（最多 ${String(value.idleTimeoutSeconds)}s）后杀掉 dsh 宿主，重启完成后哨兵会把这个会话唤醒并交回你的便签。`,
+          `守卫进程会等本回合结束（最多 ${String(value.idleTimeoutSeconds)}s）后杀掉 dsh 宿主。`,
+          ...(value.supervised
+            ? [
+                '这个宿主受一个监督者管理（它是带 IPC 通道的子进程，桌面 App 就是这样启动它的），所以守卫**不会**自己拉起宿主：那会先占住 web 端口，让监督者重启时自己的宿主撞上 EADDRINUSE，之后每次重试都失败，直到有人手动杀掉那个野宿主。',
+                '请在 App 的「应用无法启动或已意外停止」对话框里点「重启应用」（或者干脆关掉 App 重开）。新宿主一上来就会认领唤醒标记并叫醒本会话——标记已经写好，订阅是持久的，等多久都不会丢。',
+              ]
+            : [
+                `监督者没有把宿主拉起来，守卫会自己 relaunch 一份，重启完成后哨兵会把这个会话唤醒并交回你的便签。`,
+              ]),
           '现在立刻结束本回合：回合结束后的任何操作都会被重启截断。',
         ].join('\n')),
     },
@@ -1574,6 +1593,7 @@ function registerSentinelTools(runtime: SentinelRuntime, toolCtx: ContextLike, a
         relaunch: pending.relaunch,
         markerPath: pending.markerPath,
         idleTimeoutSeconds: Math.round(idleTimeoutMs / 1000),
+        supervised: pending.supervised,
       }
     },
   })))

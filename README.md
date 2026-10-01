@@ -95,6 +95,56 @@ Because the kill happens on the idle edge, call `sentinel_restart` last in a tur
 anything after it would be cut off. It takes down the whole dsh host — every session it serves, and any plugin
 holding the port. That is what "restart" means here.
 
+### Verified end to end, on a live desktop host
+
+Run on Windows against DSH 0.2.0-rc.2, desktop profile. The helper log for the handoff
+(`$DSH_HOME/sentinel-restart/helper-<id>.log`) reads:
+
+```
+07:32:55.587Z helper started (pid 39392), target host pid 28252
+07:32:55.606Z handed off to stage 2 (pid 3556)
+07:33:00.217Z agent reported idle
+07:33:02.869Z killing host descendants: [26 pids] then pid 28252
+07:33:02.872Z host pid 28252 is gone
+07:33:02.873Z marker written: …\ready-28252-mup7vsr2.flag
+07:33:10.877Z relaunching: "<Electron exe>" --expose-internals "<…dsh-desktop-host\lib\index.js>" …
+07:33:10.889Z helper done
+```
+
+What that pins down:
+
+- The helper spawned with the tool call, then waited **4.6 s** for the idle edge before touching anything —
+  it did not kill the host out from under the running turn.
+- `killing host descendants` is 26 pids, killed in reverse-depth order and excluding the helper's own tree.
+- The **8.008 s** between `marker written` and `relaunching` is `restartRespawnGraceMs` doing its job: the
+  desktop app supervises its host and calls `this.fail()` on an unexpected exit rather than respawning it, so
+  after the grace window with nothing listening the helper relaunched the host itself.
+- The new host came up as a **different pid** (35684, parented to the since-exited stage-2 helper — detached,
+  as designed), claimed the duty lease (`state` reports `duty.pid === 35684`), folded the sidecar, stored the
+  marker's baseline, and delivered the wakeup into the original session. No port, URL, or readiness handshake
+  was involved at any point — the marker file was the whole interface.
+- The guard cleaned up after itself: `request-<id>.json` is gone, `ready-<id>.flag` is kept as the record, and
+  `helper-v1.mjs` is retained for reuse.
+
+**That self-relaunch was wrong for a supervised host, and this run is how we found out.** The desktop app is
+the host's *parent*: it survives the kill, shows its `dsh desktop host stopped` dialog, and — crucially —
+starts its *own* host when the operator clicks 重启应用. Our detached replacement had already taken
+`0.0.0.0:19387`, so the app's host died of `listen EADDRINUSE` and the dialog came back. Three consecutive
+attempts produced three identical crash reports (`07-33-36`, `07-33-50`, `07-34-05`), and the port only freed
+up when the orphan was killed by hand from Task Manager.
+
+So the helper now refuses to relaunch under a supervisor, and says so in its log and in the tool's receipt.
+`supervised` is set when the host was spawned with an IPC channel (`process.channel !== undefined`) — exactly
+how the desktop app starts its host (`stdio: [..., 'ipc']`) and never how a shell or headless launch does.
+Under a supervisor the correct move is to write the marker and stop: the supervisor owns the host lifecycle,
+and the marker plus the durable watch mean the wakeup fires whenever it brings the host back, however long
+the operator takes.
+
+The desktop app window is still the casualty of the kill itself — it is the host's parent, so it survives and
+lands on that dialog. In supervised mode that dialog is now the *intended* recovery path: click 重启应用 (or
+close and reopen the app), the app starts a fresh host, that host binds the port normally, finds the marker,
+and wakes your session.
+
 ## Routes
 
 - `GET /plugins/dsh-sentinel/state?sessionId=…` — read-only state for the dock and the sidebar panel (omit `sessionId` for every session).

@@ -66,3 +66,27 @@ either broken once or is one edit away from breaking.
     failure mode dsh-market reports as "tool calls die, minimal preset fails to
     mount". Cold-load proof: a headless profile with this plugin installed and
     no local `@deepseek-ai/dsh-tools`/`dsh-llm` boots and serves its tools.
+11. **A registered watch must never outlive the thing that would feed it.**
+    `armRestart` registers its wakeup watch first and then does work that can
+    throw, so *everything* after the registration lives inside one `try` that
+    cancels on failure. Getting this wrong does not fail loudly: the watch is
+    live, it points at a marker no helper will ever write, and it probes for the
+    life of the host. It happened, and had to be cancelled by hand.
+12. **Read host services through `ctx.get`, never as a bare property.**
+    `webServer` is deliberately not in the inject list, so `ctx.webServer`
+    throws `cannot get property "webServer" without inject` on a real cordis
+    context, while `ctx.get('webServer')` and the injected scope both serve it.
+    A ctx doubled as a plain object allows the bare read, so no test written
+    against that double can catch it — `strictServiceAccess` exists to close
+    that hole. Keep the guarded direct read as a fallback: `ctx.get` is itself
+    optional.
+13. **A supervised host is never relaunched by the helper.** If the host was
+    spawned with an IPC channel (`process.channel !== undefined` — how the
+    Desktop app starts it), something else owns its lifecycle. That supervisor
+    does not respawn an unexpected exit, but it *is* alive and it does start its
+    own host when the operator restarts the app. Relaunching first takes the web
+    port, so the supervisor's host dies of `listen EADDRINUSE` on every retry
+    until the orphan is killed by hand — three identical startup crashes and a
+    Task Manager visit, in the run that established this. Write the marker and
+    stop: the marker plus the durable watch wake the session whenever the host
+    comes back, however long that takes.

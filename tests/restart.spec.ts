@@ -1,4 +1,5 @@
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
+import { existsSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -12,6 +13,7 @@ import {
   pruneRestartArtifacts,
   requestPath,
   restartDir,
+  type RestartRequest,
   writeRestartHelper,
 } from '../src/restart.ts'
 
@@ -109,9 +111,75 @@ describe('the embedded helper script', () => {
     // field names it dereferences, so a rename on one side fails here.
     for (const field of [
       'hostPid', 'goPath', 'markerPath', 'logPath', 'idleTimeoutMs',
-      'respawnGraceMs', 'cwd', 'argv', 'command',
+      'respawnGraceMs', 'cwd', 'argv', 'command', 'supervised',
     ]) {
       expect(source).toContain(`request.${field}`)
     }
+    // Ordering is load-bearing, not cosmetic: the supervised guard has to be
+    // tested BEFORE either relaunch branch, or a supervised host with a
+    // `command` set would still relaunch and steal the supervisor's port.
+    expect(source.indexOf('request.supervised === true'))
+      .toBeLessThan(source.indexOf('request.command !== undefined'))
+  })
+
+  // Windows only because the host tree is torn down through the parent-PID
+  // chain there; that is also where the failure this guards against was seen.
+  it.runIf(process.platform === 'win32')('never relaunches under a supervisor', async () => {
+    const home = await freshHome()
+    await writeRestartHelper()
+
+    // A sacrificial stand-in for the host: any long-lived process will do.
+    const host = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })
+    await new Promise(resolve => setTimeout(resolve, 500))
+
+    const id = `spec-${String(host.pid ?? 0)}`
+    const relaunchFlag = join(home, 'relaunch-happened.flag')
+    const request: RestartRequest = {
+      version: 1,
+      id,
+      hostPid: host.pid ?? 0,
+      sessionId: 'session-spec',
+      watchId: 'watch-1',
+      goPath: goPath(id),
+      markerPath: markerPath(id),
+      logPath: join(restartDir(), `helper-${id}.log`),
+      // If the supervised branch were missing, the helper would run this and
+      // drop the flag — which is precisely the port-stealing relaunch that
+      // broke three Desktop app startups with EADDRINUSE.
+      argv: [
+        process.execPath,
+        '-e',
+        `require("node:fs").writeFileSync(${JSON.stringify(relaunchFlag)}, "relaunched")`,
+      ],
+      cwd: home,
+      supervised: true,
+      idleTimeoutMs: 5000,
+      respawnGraceMs: 200,
+    }
+    await writeFile(requestPath(id), `${JSON.stringify(request)}\n`, 'utf8')
+    await writeFile(request.goPath, new Date().toISOString(), 'utf8')
+
+    execFileSync(process.execPath, [helperPath(), requestPath(id)], { stdio: 'pipe' })
+    // Stage 1 re-spawns itself detached and exits immediately (on Windows the
+    // host tree is killed through the parent-PID chain, so a helper still
+    // hanging off the host would be killed by its own hand). execFileSync
+    // therefore returns long before the kill; wait for stage 2 to finish.
+    const settled = Date.now() + 20_000
+    let log = ''
+    while (Date.now() < settled) {
+      log = await readFile(request.logPath, 'utf8').catch(() => '')
+      if (log.includes('helper done')) break
+      await new Promise(resolve => setTimeout(resolve, 100))
+    }
+    expect(log).toContain('helper done')
+
+    // The wakeup still happened — the marker is the whole point of the trip.
+    expect((await readFile(request.markerPath, 'utf8')).length).toBeGreaterThan(0)
+    // …and nothing was relaunched, which is what the supervised guard is for.
+    expect(log).toContain('not relaunching')
+    expect(existsSync(relaunchFlag)).toBe(false)
+    // The guard cleaned up after itself either way.
+    expect(existsSync(requestPath(id))).toBe(false)
+    host.kill()
   })
 })
