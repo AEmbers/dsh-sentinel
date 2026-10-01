@@ -145,6 +145,29 @@ lands on that dialog. In supervised mode that dialog is now the *intended* recov
 close and reopen the app), the app starts a fresh host, that host binds the port normally, finds the marker,
 and wakes your session.
 
+### …and the fix, verified on the same host
+
+A second run against v0.13.4, with the app still supervising (host 24016, parented to the Electron main):
+
+```
+08:13:03.070Z helper started (pid 35452), target host pid 24016
+08:13:09.205Z agent reported idle
+08:13:11.900Z killing host descendants: [10 pids] then pid 24016
+08:13:11.903Z marker written: …\ready-24016-mup9beei.flag
+08:13:19.920Z host is supervised and the supervisor has not brought it back; not relaunching. …
+08:13:19.921Z helper done
+```
+
+The 8.017 s wait is `restartRespawnGraceMs` again, and this time it ends in a refusal to relaunch — no
+`relaunching:` line follows. The operator clicked 重启应用 about 52 s later; the app started its own host
+(27936, parented to the app rather than to the helper), which bound 19387, claimed the duty lease, and
+delivered the wakeup into the originating session.
+
+The two runs are separated cleanly by their crash reports: the broken one left **three**
+`listen EADDRINUSE` reports at `phase: startup`, and the fixed one leaves **one** report at `phase: running`
+— the app noticing that its host was killed, which is exactly the dialog the operator is meant to answer.
+Nothing at all about the port.
+
 ## Routes
 
 - `GET /plugins/dsh-sentinel/state?sessionId=…` — read-only state for the dock and the sidebar panel (omit `sessionId` for every session).

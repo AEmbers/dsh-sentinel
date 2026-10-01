@@ -118,6 +118,23 @@ Node 侧持有一个与 server 同生命周期的运行时：把插件自己的 
 
 桌面 App 窗口仍然是那一刀本身的代价——它是宿主的父进程，所以它会活下来并停在那张对话框上。在受监督模式下，这张对话框现在就是**预期中**的恢复入口：点「重启应用」（或者关掉 App 重开），App 会启动一个全新的宿主，它正常绑定端口、发现标记，然后唤醒你的会话。
 
+### ……以及这个修复本身，在同一台机器上的实测
+
+第二次跑，用的是 v0.13.4，App 仍在监督（宿主 24016，父进程是 Electron 主进程）：
+
+```
+08:13:03.070Z helper started (pid 35452), target host pid 24016
+08:13:09.205Z agent reported idle
+08:13:11.900Z killing host descendants: [10 个 pid] then pid 24016
+08:13:11.903Z marker written: …\ready-24016-mup9beei.flag
+08:13:19.920Z host is supervised and the supervisor has not brought it back; not relaunching. …
+08:13:19.921Z helper done
+```
+
+那 8.017 秒的等待仍然是 `restartRespawnGraceMs`，而这一次它以**拒绝 relaunch** 收尾——后面**没有**任何 `relaunching:` 行。操作员约 52 秒后点了「重启应用」；App 启动了自己的宿主（27936，父进程是 App 而不是守卫），它绑定 19387、接管 duty 租约，并把唤醒投递回了原会话。
+
+两次运行在崩溃报告上区分得非常干净：翻车那次留下**三份** `phase: startup` 的 `listen EADDRINUSE`；修好这次只剩**一份** `phase: running` 的报告——那是 App 察觉到自己的宿主被杀（正是操作员该去应答的那张对话框），关于端口的部分一个字都没有。
+
 ## 路由
 
 - `GET /plugins/dsh-sentinel/state?sessionId=…` — dock 和侧边栏面板用的只读状态（省略 `sessionId` 返回所有会话）。
