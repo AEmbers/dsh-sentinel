@@ -191,6 +191,8 @@ child.once("close", (code) => {
 
 在以下宿主版本上实测通过（插件加载、duty 租约持有、web 路由应答均正常）：
 
+- `0.2.1-alpha.1` —— 2026-10-07，对线上 profile 副本的彩排：插件激活、持有 duty 租约、下发客户端半侧并应答 state 路由（boot 图 68 条）。能到这一步需要放宽 peer 范围（见下方 `0.2.0-rc.2`）；并直接调用宿主的 `evaluatePluginCompatibility` 核对了版本闸门：当前范围放行 `0.2.0-rc.2` 与 `0.2.1-alpha.1`，仍拒绝 `0.2.0-rc.1` 及更旧。
+
 - `0.2.0-rc.2` —— 2026-10-01，Windows 桌面端实测：harness 依赖范围重新钉到 0.2.0 线，`@deepseek-ai/schemastery`
   对齐到宿主的 `^3.18.4`——0.2.0 的 schema 类型面更严，`Schema<Config>` 不再接受 `meta.default` 带 schemastery
   新版 `Volatile` 标记的 schema。顺带查出并修掉两个 Windows 缺陷：对「路径里还留着 8.3 短名成分」（如
@@ -206,7 +208,10 @@ child.once("close", (code) => {
   断言的其实是「调度器赏脸」——现在改为轮询 sidecar 里那条持久化基线行。改动后连续 29 轮全量跑里只有 1 轮失败、
   且之后 20 轮再没复现（那一轮与一次并发构建重叠），改动前大约 3 轮里就有 1 轮失败。harness import 也从
   `dependencies` 改成了 `peerDependencies`——见下面「为什么 harness 依赖是 peer 而不是 dependency」，
-  这正是消除 dsh-market 那条宿主依赖警告、并让插件不再把 `@deepseek-ai/dsh-tools` / `dsh-llm` 从宿主手里占走的原因
+  这正是消除 dsh-market 那条宿主依赖警告、并让插件不再把 `@deepseek-ai/dsh-tools` / `dsh-llm` 从宿主手里占走的原因。
+
+**2026-10-07 补充：**三个 harness peer 由"精确单一版本"放宽为 `>=0.2.0-rc.2 <0.3.0`，一份构建即可服务整条 0.2 线，而不是只能服务某一个发行版——精确钉版会让插件在紧邻的下一个 0.2.x 上直接装不上，0.1.7 升 0.2.0 时就是这么坏的。
+
 - `0.1.7-rc.2` —— 2026-09-29，对线上 profile 的副本做整轮净装升级彩排：0.1.7 删除了共享的兜底 `plugin` 消息来源 kind（改为每个生产者声明自己的），因此唤醒携带 `{ kind: 'sentinel' }`——在会话流里落位同为 `context`，两条版本线上都渲染为 "Sentinel"。harness 依赖范围也重新钉到 0.1.7 线：严格 semver 下 `>=0.1.5-rc.2 <0.2.0` **不包含** `0.1.7-rc.2`（预发布规则），若不改，0.1.7 宿主会把本插件的 harness import 解析到 0.1.5 的副本——正是 0.1.5 对齐时消除掉的那类漂移。实测：`pnpm typecheck` 与全部 63 个测试通过，插件激活并持有 duty 租约，web 路由应答正常，下发的客户端 bundle 含 `sidebar.panellist`（boot 图 65 条）
 - `0.1.5-rc.2` —— 2026-09-15，对齐 0.1.5 后的正式 web 部署实测：插件整条运行时 import 闭包都解析到部署线（harness 依赖改为显式 dependencies，profile 里更旧的 hoisted 副本再也遮不住它们），客户端半侧去掉 shim 后按真实 0.1.5 类型构建，`pnpm typecheck` 与全部 63 个测试通过，线上文件 watch 在改动后 1s 内经 inotify 触发，唤醒作为 plugin 来源的会话消息投递进会话；重启后部署下发的是新的客户端半侧（bundle rev 变更、含 `sidebar.panellist`、boot 图 54 条）
 - `0.1.5-alpha.2` —— 2026-09-09，临时 web profile 实测：Node 插件加载、duty 租约、state/dashboard 路由和浏览器插件 bundle 均正常，浏览器控制台无报错；`conversation.input.dock` 仍是有效的会话级 list slot，插件 sidecar 不受 Session V3 迁移影响
