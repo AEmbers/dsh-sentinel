@@ -13,6 +13,8 @@ import {
   pruneRestartArtifacts,
   requestPath,
   restartDir,
+  splitWindowsCommandLine,
+  supervisorCommandLine,
   type RestartRequest,
   writeRestartHelper,
 } from '../src/restart.ts'
@@ -94,6 +96,63 @@ describe('describeRelaunch', () => {
   it('quotes only the parts that need it', () => {
     expect(describeRelaunch(['C:\\a b\\host.exe', '--flag', 'C:\\cli.js']))
       .toBe('"C:\\a b\\host.exe" --flag C:\\cli.js')
+  })
+})
+
+describe('splitWindowsCommandLine', () => {
+  it('keeps the desktop app invocation intact', () => {
+    // The real thing, captured off the live app on 2026-10-17: launching only
+    // the binary (what `process.execPath` gives) opens Electron's default
+    // window and never starts a host, so every part of this line matters.
+    const line = 'D:\\dsh\\dsh-desktop-src\\node_modules\\.pnpm\\electron@44.7.0_supports-color@9.4.0\\node_modules\\electron\\dist\\electron.exe'
+      + ' --inspect=127.0.0.1:9229 --remote-debugging-port=9222'
+      + ' --user-data-dir=D:\\dsh\\dsh-desktop-src\\apps\\desktop\\.desktop-build\\development\\electron-user-data'
+      + ' D:\\dsh\\dsh-desktop-src\\apps\\desktop'
+    expect(splitWindowsCommandLine(line)).toEqual([
+      'D:\\dsh\\dsh-desktop-src\\node_modules\\.pnpm\\electron@44.7.0_supports-color@9.4.0\\node_modules\\electron\\dist\\electron.exe',
+      '--inspect=127.0.0.1:9229',
+      '--remote-debugging-port=9222',
+      '--user-data-dir=D:\\dsh\\dsh-desktop-src\\apps\\desktop\\.desktop-build\\development\\electron-user-data',
+      'D:\\dsh\\dsh-desktop-src\\apps\\desktop',
+    ])
+  })
+
+  it('unwraps quoted paths and collapses the backslashes in front of a quote', () => {
+    expect(splitWindowsCommandLine('"C:\\Program Files\\App\\app.exe" --name "two words"'))
+      .toEqual(['C:\\Program Files\\App\\app.exe', '--name', 'two words'])
+    // 2n backslashes + quote: n backslashes, quote toggles.
+    expect(splitWindowsCommandLine('"C:\\dir\\\\" tail')).toEqual(['C:\\dir\\', 'tail'])
+    // 2n+1 backslashes + quote: n backslashes, a literal quote.
+    expect(splitWindowsCommandLine('a\\\\\\"b c')).toEqual(['a\\"b', 'c'])
+    // `""` inside a quoted run is a literal quote.
+    expect(splitWindowsCommandLine('"say ""hi"" now"')).toEqual(['say "hi" now'])
+  })
+
+  it('treats empty quoted arguments as present, not absent', () => {
+    expect(splitWindowsCommandLine('exe "" tail')).toEqual(['exe', '', 'tail'])
+    expect(splitWindowsCommandLine('   ')).toEqual([])
+  })
+})
+
+describe('supervisorCommandLine', () => {
+  it('reads this process own command line back from the OS', () => {
+    const argv = supervisorCommandLine(process.pid)
+    const readable = process.platform === 'win32' || existsSync('/proc')
+    if (!readable) {
+      expect(argv).toBeUndefined()
+      return
+    }
+    expect(argv?.length ?? 0).toBeGreaterThan(0)
+    if (process.platform === 'win32') {
+      // The first token is the binary that was actually launched — which is the
+      // part the old bare-`execPath` relaunch threw away.
+      expect((argv?.[0] ?? '').toLowerCase()).toBe(process.execPath.toLowerCase())
+    }
+  })
+
+  it('declines instead of guessing when there is no such process', () => {
+    expect(supervisorCommandLine(0)).toBeUndefined()
+    expect(supervisorCommandLine(-1)).toBeUndefined()
   })
 })
 

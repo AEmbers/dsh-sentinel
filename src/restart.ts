@@ -28,7 +28,8 @@
  * is idle does the helper pull the plug, so a restart cannot truncate the very
  * turn that requested it.
  */
-import { spawn } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
+import { readFileSync } from 'node:fs'
 import { mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
@@ -99,10 +100,13 @@ export interface RestartRequest {
    */
   readonly supervisorPid?: number
   /**
-   * How to bring the supervisor back, as argv. The helper strips
-   * `ELECTRON_RUN_AS_NODE` (inherited from the host, which *is* Electron running
-   * as Node) and launches this detached, so the desktop app starts normally and
-   * spawns a host of its own — which binds the port and picks up the marker.
+   * How to bring the supervisor back: its FULL command line, captured from the
+   * OS by {@link supervisorCommandLine} — not just `process.execPath`. The
+   * helper strips `ELECTRON_RUN_AS_NODE` (inherited from the host, which *is*
+   * Electron running as Node) and launches this detached, so the desktop app
+   * starts normally and spawns a host of its own — which binds the port and
+   * picks up the marker. Absent when the supervisor's command line could not be
+   * read; relaunching the bare binary would only open Electron's default window.
    *
    * `app.relaunch()` is the app's own restart, but nothing outside the app can
    * invoke it, and a second launch is only routed to `second-instance`, which
@@ -137,6 +141,104 @@ export function derivedRelaunch(
 /** Human-readable form of a relaunch plan, for receipts and logs. */
 export function describeRelaunch(argv: readonly string[]): string {
   return argv.map(part => (part.includes(' ') ? `"${part}"` : part)).join(' ')
+}
+
+/**
+ * The supervisor's own argv, read back from the OS.
+ *
+ * `process.execPath` is NOT the answer, and launching it bare is actively
+ * wrong: under the desktop app the host runs as Electron-as-Node, so
+ * `execPath` is the electron binary while the app itself is a *different*
+ * invocation of that same binary — `electron.exe <flags…> <appDir>`. Spawning
+ * the binary alone opens Electron's built-in default window, which starts no
+ * app, spawns no host and never serves the port: the operator is left with a
+ * dead window and has to restart the app by hand. Observed for real on
+ * 2026-10-17 (window closed at 17:50:24, relaunched bare, never served).
+ *
+ * So the whole command line is captured instead of guessed. Windows exposes it
+ * through WMI; a Linux dev host has it in `/proc`. Anything else returns
+ * undefined, and the caller then declines to relaunch rather than launch
+ * something that cannot come back.
+ */
+export function supervisorCommandLine(pid: number): string[] | undefined {
+  if (!Number.isInteger(pid) || pid <= 0) return undefined
+  if (process.platform === 'win32') {
+    try {
+      const line = execFileSync('powershell', [
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}").CommandLine`,
+      ], { encoding: 'utf8', windowsHide: true, timeout: 20000 }).trim()
+      const argv = splitWindowsCommandLine(line)
+      return argv.length > 0 ? argv : undefined
+    } catch {
+      return undefined
+    }
+  }
+  try {
+    const raw = readFileSync(`/proc/${pid}/cmdline`, 'utf8')
+    const argv = raw.split('\0').filter(part => part !== '')
+    return argv.length > 0 ? argv : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Split a Windows command line the way CommandLineToArgvW does.
+ *
+ * The rule that matters here is backslash runs before a quote: 2n backslashes
+ * plus `"` is n backslashes and a delimiter toggle, 2n+1 backslashes plus `"`
+ * is n backslashes and a literal quote. Paths like `C:\…\electron.exe` and
+ * `--user-data-dir=D:\…` survive it unchanged; `""` inside a quoted run is a
+ * literal quote.
+ */
+export function splitWindowsCommandLine(line: string): string[] {
+  const args: string[] = []
+  const length = line.length
+  let i = 0
+  while (i < length) {
+    while (i < length && (line[i] === ' ' || line[i] === '\t')) i += 1
+    if (i >= length) break
+    let current = ''
+    let quoted = false
+    while (i < length) {
+      const char = line[i] as string
+      if (char === '\\') {
+        let slashes = 0
+        while (i < length && line[i] === '\\') {
+          slashes += 1
+          i += 1
+        }
+        if (i < length && line[i] === '"') {
+          current += '\\'.repeat(Math.floor(slashes / 2))
+          if (slashes % 2 === 1) {
+            current += '"'
+            i += 1
+          }
+        } else {
+          current += '\\'.repeat(slashes)
+        }
+        continue
+      }
+      if (char === '"') {
+        if (quoted && line[i + 1] === '"') {
+          current += '"'
+          i += 2
+          continue
+        }
+        quoted = !quoted
+        i += 1
+        continue
+      }
+      if (!quoted && (char === ' ' || char === '\t')) break
+      current += char
+      i += 1
+    }
+    args.push(current)
+  }
+  return args
 }
 
 /** Delete handoff residue from previous runs (called on each new request). */
@@ -324,14 +426,16 @@ try {
       stdio: 'ignore',
     })
     app.unref()
-    // The port probe is only meaningful when the request carried one.
+    // The port probe is only meaningful when the request carried one. A dev
+    // build of the desktop app needs ~16s from launch to a served port, so the
+    // window is 45s rather than the 30s that used to time out mid-boot.
     if (request.port !== undefined) {
       let up = false
-      for (let waited = 0; waited < 30000 && !up; waited += 1000) {
+      for (let waited = 0; waited < 45000 && !up; waited += 1000) {
         await sleep(1000)
         up = await hostAnswers(request)
       }
-      await log(up ? 'supervising app is back and serving' : 'supervising app did not serve within 30s')
+      await log(up ? 'supervising app is back and serving' : 'supervising app did not serve within 45s')
     }
   } else if (request.supervised === true) {
     await log('host is supervised but the supervisor cannot be relaunched from here; not relaunching. Restart the app that owns this host — the wakeup marker is already written and the watch survives the wait.')

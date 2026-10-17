@@ -72,6 +72,7 @@ import {
   requestPath,
   restartDir,
   spawnRestartHelper,
+  supervisorCommandLine,
   type RestartRequest,
 } from './restart.ts'
 import { SentinelStore, type FoldableRow } from './store.ts'
@@ -1019,10 +1020,14 @@ class SentinelRuntime {
       // port, so the helper must not relaunch underneath it.
       const supervised = process.channel !== undefined
       // Under Electron-as-Node — which is how the desktop host runs —
-      // `process.execPath` IS the desktop app, so the supervisor can be brought
-      // back by launching that same binary bare. Under plain Node it cannot,
-      // and the helper falls back to refusing.
+      // `process.execPath` is the Electron binary, but the app is a different
+      // invocation of that binary with an app path. Only the supervisor's own
+      // command line brings it back; launching the binary bare opens Electron's
+      // default window and never starts a host (see supervisorCommandLine).
       const relaunchSupervisor = supervised && process.versions['electron'] !== undefined
+      const supervisorRelaunch = relaunchSupervisor
+        ? supervisorCommandLine(process.ppid)
+        : undefined
       request = {
         version: 1,
         id,
@@ -1036,8 +1041,8 @@ class SentinelRuntime {
         cwd,
         ...(port !== undefined ? { port } : {}),
         ...(supervised ? { supervised: true } : {}),
-        ...(relaunchSupervisor
-          ? { supervisorPid: process.ppid, supervisorRelaunch: [process.execPath] }
+        ...(supervisorRelaunch !== undefined
+          ? { supervisorPid: process.ppid, supervisorRelaunch }
           : {}),
         idleTimeoutMs,
         respawnGraceMs: this.config.restartRespawnGraceMs,
