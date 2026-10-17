@@ -52,6 +52,8 @@ All deployment-tunable knobs live in the plugin's config schema (defaults in par
     restartCommand: ''           # how the restart helper relaunches the host (default: this process's own command line)
     restartIdleTimeoutMs: 120000 # how long it waits for the calling turn to end before killing the host anyway
     restartRespawnGraceMs: 8000  # after the kill, how long to wait for a supervisor to bring the host back
+    restartWakeInterruptedSessions: true  # also wake the other sessions whose turns this restart cut off
+    restartWakeInterruptedLimit: 8        # cap on how many interrupted sessions one restart arms
 ```
 
 Invalid values fail plugin load with a schema error rather than misbehaving at runtime. `dutyLeaseTtlMs` must be at least twice `heartbeatMs` and the runtime refuses to start otherwise — the owner renews once per heartbeat, so a shorter lease is stale for part of every cycle and a second instance can claim duty beside it and deliver the same wakeup twice.
@@ -63,7 +65,8 @@ Invalid values fail plugin load with a schema error rather than misbehaving at r
 - `sentinel_watch` — register a watch: `kind`, `target`, optional `pattern`, `interval` (1–3600s, default 30), `note` (delivered verbatim with every wakeup), `maxFires` (default 1: one-shot), `cooldown` (default 60s), optional `ttl`.
 - `sentinel_list` — active watches with live probe state.
 - `sentinel_cancel` — cancel one watch by id.
-- `sentinel_restart` — restart the dsh host and be woken back into the same session (see below).
+- `sentinel_restart` — restart the dsh host and be woken back into the same session, plus every other session
+  whose turn the restart cut off (see below).
 
 ### Restarting the host and coming back
 
@@ -86,6 +89,12 @@ running process at all:
    bring the host back on its own, and doubling it would collide on the port.
 4. The replacement host folds the sidecar, re-seeds the probe baseline, sees the marker as a real snapshot
    change against `<absent>`, and wakes the dormant session with your note.
+5. This host served more than that one session: before the handoff, every session that is **mid-turn**
+   (`agents.roots()`, excluding the caller) gets its own one-shot watch on the **same marker**, baselined the
+   same way while the old host is still alive. The replacement host fires them together, so each interrupted
+   session is told its turn was cut off and to re-check its progress before continuing — a restart no longer
+   strands other people's work in the downtime. One subscription per session means each is woken once; a
+   session that cannot be armed (a full subscription list) logs a warning and never breaks the restart itself.
 
 The marker file is the *entire* interface between the two processes: no port, no URL, no readiness handshake
 to get wrong. When the tool cannot determine a relaunch command (no entry script in `process.argv` and no
@@ -94,6 +103,9 @@ to get wrong. When the tool cannot determine a relaunch command (no entry script
 Because the kill happens on the idle edge, call `sentinel_restart` last in a turn and then **end the turn**;
 anything after it would be cut off. It takes down the whole dsh host — every session it serves, and any plugin
 holding the port. That is what "restart" means here.
+Which is exactly why it wakes more than the caller: every session mid-turn at handoff time is woken too
+(`restartWakeInterruptedSessions`, on by default; at most `restartWakeInterruptedLimit` of them, 8 by
+default, extras are only logged). The list is taken **at handoff**: a turn started after that is not in it.
 
 ### Verified end to end, on a live desktop host
 

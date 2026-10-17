@@ -144,6 +144,15 @@ export interface Config {
    * ourselves (ms). Waiting avoids a doubled host and a port collision.
    */
   restartRespawnGraceMs: number
+  /**
+   * Wake every session whose turn this restart cuts off, not only the caller.
+   * A restart kills the whole host, so any other session mid-turn loses its
+   * work with no way to notice; arming the same marker watch for each of them
+   * restores all of them in the replacement host, exactly like the caller.
+   */
+  restartWakeInterruptedSessions: boolean
+  /** Upper bound on interrupted sessions one restart arms wakeups for. */
+  restartWakeInterruptedLimit: number
 }
 
 export const DEFAULT_CONFIG: Config = {
@@ -156,6 +165,8 @@ export const DEFAULT_CONFIG: Config = {
   dutyLeaseTtlMs: 30_000,
   restartIdleTimeoutMs: 120_000,
   restartRespawnGraceMs: 8_000,
+  restartWakeInterruptedSessions: true,
+  restartWakeInterruptedLimit: 8,
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -170,9 +181,15 @@ export const Config: Schema<Config> = Schema.object({
   restartCommand: Schema.string().description('Command line the detached restart helper runs to relaunch the host; empty rebuilds the current process\'s own command line.'),
   restartIdleTimeoutMs: Schema.number().default(DEFAULT_CONFIG.restartIdleTimeoutMs).description('How long the restart helper waits for the calling agent to go idle before killing the host anyway (ms).'),
   restartRespawnGraceMs: Schema.number().default(DEFAULT_CONFIG.restartRespawnGraceMs).description('After the kill, how long to wait for a supervisor to bring the host back before relaunching it ourselves (ms).'),
+  restartWakeInterruptedSessions: Schema.boolean().default(DEFAULT_CONFIG.restartWakeInterruptedSessions).description('Wake every session whose turn the restart interrupted, not only the caller (the restart kills the whole host).'),
+  restartWakeInterruptedLimit: Schema.number().default(DEFAULT_CONFIG.restartWakeInterruptedLimit).description('Upper bound on interrupted sessions one restart arms wakeups for.'),
 })
 
 const PLUGIN_ID = 'dsh-sentinel'
+/** Wakeup text delivered to a session whose turn the restart cut off. */
+const INTERRUPTED_WAKE_NOTE = '宿主刚刚重启完成（sentinel_restart）。重启前你正在跑的那一轮被强制中断：先核对当前进度与文件状态，重做被截断的步骤，然后继续未完成的工作。'
+/** Slack past the helper's idle timeout after which an unused restart wakeup expires. */
+const RESTART_WAKE_TTL_SLACK_SECONDS = 900
 export const STATE_PATH = `/plugins/${PLUGIN_ID}/state`
 export const HOOK_PATH = `/plugins/${PLUGIN_ID}/hook`
 export const CANCEL_PATH = `/plugins/${PLUGIN_ID}/cancel`
@@ -372,6 +389,8 @@ interface PendingRestart {
   readonly relaunchSupervisor: boolean
   /** Writes the go file that lets the helper proceed; idempotent. */
   readonly release: () => void
+  /** Other sessions whose interrupted turns this restart will also wake. */
+  readonly wakeSessions: string[]
 }
 
 /** All sentinel state for one session; lives as long as the server, not the agent. */
@@ -890,6 +909,59 @@ class SentinelRuntime {
   }
 
   /**
+   * Arm the same marker wakeup for every other session this restart will
+   * interrupt.
+   *
+   * The restart kills the whole host, so every other session that is mid-turn
+   * loses its work — and, unlike the caller, it never learns that anything
+   * happened. Each of them gets its own one-shot subscription on the same
+   * marker, primed while this host is still alive and probing, so the
+   * replacement host folds them exactly like the caller's and wakes all of
+   * them. Arming is per-session isolated: one failure (a session that cannot be
+   * resumed, a full subscription list) must never take the restart down.
+   */
+  private async armInterruptedWakeups(
+    exceptSessionId: string,
+    marker: string,
+    idleTimeoutMs: number,
+  ): Promise<string[]> {
+    if (!this.config.restartWakeInterruptedSessions) return []
+    let candidates: AgentLike[]
+    try {
+      candidates = this.ctx.agents.roots().filter(agent =>
+        agent.id !== exceptSessionId && agent.status === 'running')
+    } catch (error: unknown) {
+      this.warn(`could not enumerate running sessions for the restart wakeup: ${describe(error)}`)
+      return []
+    }
+    const limit = Math.max(0, Math.trunc(this.config.restartWakeInterruptedLimit))
+    if (candidates.length > limit) {
+      this.warn(`restart would interrupt ${String(candidates.length)} running sessions; arming ${String(limit)} of them (restartWakeInterruptedLimit)`)
+      candidates = candidates.slice(0, limit)
+    }
+    const ttlSeconds = Math.ceil(idleTimeoutMs / 1000) + RESTART_WAKE_TTL_SLACK_SECONDS
+    const armed: string[] = []
+    for (const agent of candidates) {
+      try {
+        const subscription = await this.create(
+          agent.id,
+          { kind: 'file', target: marker, intervalSeconds: MIN_INTERVAL_SECONDS },
+          INTERRUPTED_WAKE_NOTE,
+          1,
+          this.config.defaultCooldownSeconds,
+          ttlSeconds,
+        )
+        await this.primeBaseline(agent.id, subscription.id)
+        armed.push(agent.id)
+      } catch (error: unknown) {
+        this.warn(`could not arm a restart wakeup for interrupted session "${agent.id}": ${describe(error)}`)
+      }
+    }
+    if (armed.length > 0) this.warn(`armed restart wakeups for ${String(armed.length)} interrupted session(s): ${armed.join(', ')}`)
+    return armed
+  }
+
+  /**
    * Arm a restart handoff: register the marker watch, persist its baseline,
    * and start the detached helper. Everything destructive happens in the
    * helper, after the calling agent goes idle — never in this turn.
@@ -938,6 +1010,7 @@ class SentinelRuntime {
     // for as long as this host lives. The port read in particular used to sit
     // outside and throw on the real host, orphaning exactly such a watch.
     let request: RestartRequest
+    let wakeSessions: string[] = []
     try {
       const port = this.webPort()
       // An IPC channel means something parented this host and supervises it —
@@ -970,6 +1043,9 @@ class SentinelRuntime {
         respawnGraceMs: this.config.restartRespawnGraceMs,
       }
       await this.primeBaseline(sessionId, subscription.id)
+      // Every other session mid-turn is about to be cut off by the same kill;
+      // arm their wakeups now, while this host can still persist baselines.
+      wakeSessions = await this.armInterruptedWakeups(sessionId, marker, idleTimeoutMs)
       await spawnRestartHelper(request)
     } catch (error: unknown) {
       await this.cancel(sessionId, subscription.id, 'agent').catch(() => {})
@@ -986,6 +1062,7 @@ class SentinelRuntime {
       relaunch: relaunchText,
       supervised: request.supervised === true,
       relaunchSupervisor: request.supervisorRelaunch !== undefined,
+      wakeSessions,
       release: () => {
         if (released) return
         released = true
@@ -1395,6 +1472,11 @@ const RESTART_OUTPUT_SCHEMA = {
     idleTimeoutSeconds: { type: 'integer', required: true },
     supervised: { type: 'boolean', required: true },
     relaunchSupervisor: { type: 'boolean', required: true },
+    wakeSessions: {
+      type: 'array',
+      required: true,
+      items: { type: 'string' },
+    },
   },
 } as const
 
@@ -1570,7 +1652,10 @@ function registerSentinelTools(runtime: SentinelRuntime, toolCtx: ContextLike, a
       ' snapshot change, and wakes this session with your note.',
       ' Call this LAST in a turn and then end the turn: the kill happens on the idle edge, so anything you do',
       ' afterwards would be truncated. The whole dsh host goes down, including other sessions and any plugin',
-      ' holding the port — that is what "restart" means here.',
+      ' holding the port — that is what "restart" means here. Every OTHER session that is mid-turn right now is',
+      ' woken as well: each gets its own one-shot wakeup telling it the restart cut its turn off, so a restart',
+      ' no longer silently strands the sessions it killed (disable with restartWakeInterruptedSessions=false,',
+      ' cap with restartWakeInterruptedLimit).',
       ' Refuses to act when it cannot determine a way to relaunch (no entry script and no restartCommand),',
       ' because a host that does not come back is worse than no restart.',
     ].join(''),
@@ -1596,12 +1681,15 @@ function registerSentinelTools(runtime: SentinelRuntime, toolCtx: ContextLike, a
     },
     output: {
       schema: RESTART_OUTPUT_SCHEMA,
-      render: (_args: unknown, value: { requestId: string; watchId: string; relaunch: string; markerPath: string; idleTimeoutSeconds: number; supervised: boolean; relaunchSupervisor: boolean }) =>
+      render: (_args: unknown, value: { requestId: string; watchId: string; relaunch: string; markerPath: string; idleTimeoutSeconds: number; supervised: boolean; relaunchSupervisor: boolean; wakeSessions: string[] }) =>
         textBlock([
           `重启交接已就绪: ${value.requestId}（哨兵订阅 ${value.watchId}）`,
           `重启命令: ${value.relaunch}`,
           `唤醒标记: ${value.markerPath}`,
           `守卫进程会等本回合结束（最多 ${String(value.idleTimeoutSeconds)}s）后杀掉 dsh 宿主。`,
+          value.wakeSessions.length > 0
+            ? `除了本会话，重启后还会唤醒 ${String(value.wakeSessions.length)} 个被这次重启打断了回合的会话：${value.wakeSessions.join('、')}`
+            : '重启时没有其它正在运行的会话，只需要叫醒本会话。',
           ...(value.relaunchSupervisor
             ? [
                 '这个宿主由桌面 App 监督（它是带 IPC 通道的子进程）。守卫会把 **App 连同宿主一起** 关掉——顺序是先杀 App，因为 App 对宿主退出**任何**退出码都会弹「应用无法启动或已意外停止」对话框，只有抢在它之前动手才能不弹框。',
@@ -1637,6 +1725,7 @@ function registerSentinelTools(runtime: SentinelRuntime, toolCtx: ContextLike, a
         idleTimeoutSeconds: Math.round(idleTimeoutMs / 1000),
         supervised: pending.supervised,
         relaunchSupervisor: pending.relaunchSupervisor,
+        wakeSessions: pending.wakeSessions,
       }
     },
   })))
